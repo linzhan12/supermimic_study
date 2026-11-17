@@ -1,0 +1,14 @@
+# Local environments, caches, and generated training output
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+wandb/
+logs/
+outputs/
+uv/
+.env
+.env.*
+!.env.example
