@@ -1,6 +1,23 @@
 import torch
 
-from supermimic.tasks.velocity_posture import lower_body_score
+from supermimic.tasks.velocity_posture import arm_swing_score, lower_body_score
+
+
+def test_forward_arm_reward_favors_moderate_opposite_swing():
+  command = torch.tensor([[0.35, 0.0, 0.0], [0.35, 0.0, 0.0]])
+  hips = torch.tensor([[0.25, -0.25], [-0.25, 0.25]], requires_grad=True)
+  arms = torch.tensor([[-0.15, 0.15], [0.15, -0.15]], requires_grad=True)
+  preferred = arm_swing_score(arms, hips, command)
+  still = arm_swing_score(torch.zeros_like(arms), hips, command)
+  reversed_arms = arm_swing_score(-arms, hips, command)
+  assert torch.all(preferred > still)
+  assert torch.all(still > reversed_arms)
+  torch.testing.assert_close(
+    arm_swing_score(arms, hips, torch.zeros_like(command)), torch.zeros(2)
+  )
+  preferred.sum().backward()
+  assert arms.grad is not None and arms.grad.abs().max() > 0
+  assert hips.grad is None
 
 
 def test_zero_command_rewards_settled_pose_and_double_support():

@@ -200,6 +200,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Fine-tune the velocity encoder with independent flat-ground commands."""
   posture_weight: float = 0.0
   """Weight for the phase-conditioned posture reward in independent velocity training."""
+  moving_posture_scale: float = 1.0
+  """Posture weight multiplier during nonzero velocity commands."""
+  arm_swing_weight: float = 0.0
+  """Weight for contralateral arm swing during forward walking."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(

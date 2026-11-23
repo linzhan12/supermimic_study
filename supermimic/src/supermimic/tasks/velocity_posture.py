@@ -38,6 +38,44 @@ def lower_body_score(
   return torch.where((command == 0).all(-1), standing, moving)
 
 
+def arm_swing_score(
+  shoulder_offset: torch.Tensor, hip_pitch: torch.Tensor, command: torch.Tensor
+) -> torch.Tensor:
+  """Score moderate contralateral swing during forward walking."""
+  hip_difference = (hip_pitch[..., 0] - hip_pitch[..., 1]).detach()
+  swing = 0.24 * torch.tanh(hip_difference / 0.22)
+  target = torch.stack((-swing, swing), dim=-1)
+  error = ((shoulder_offset - target) / 0.13).square().mean(dim=-1)
+  forward = ((command[..., 0] - 0.1) / 0.15).clamp(0, 1)
+  straight = torch.exp(
+    -(command[..., 1] / 0.12).square() - (command[..., 2] / 0.16).square()
+  )
+  return forward * straight / (1 + error)
+
+
+class VelocityArmSwingReward:
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    robot = env.scene["robot"]
+    self.shoulders = tuple(
+      robot.joint_names.index(f"{side}_shoulder_pitch_joint")
+      for side in ("left", "right")
+    )
+    self.hips = tuple(
+      robot.joint_names.index(f"{side}_hip_pitch_joint") for side in ("left", "right")
+    )
+    self.rest = robot.data.default_joint_pos[0, self.shoulders].clone()
+
+  def score(self, q: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+    return arm_swing_score(
+      q[..., self.shoulders] - self.rest, q[..., self.hips], command
+    )
+
+  def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    return self.score(
+      env.scene["robot"].data.joint_pos, env.command_manager.get_command("velocity")
+    )
+
+
 class VelocityPostureReward:
   """Score the same integrated G1 state in simulation and imagination."""
 
@@ -82,6 +120,7 @@ class VelocityPostureReward:
     q: torch.Tensor,
     qd: torch.Tensor,
     command: torch.Tensor,
+    moving_scale: float = 1.0,
   ) -> torch.Tensor:
     # Flat-ground support depends on root height and is invariant to horizontal origin.
     zeros = torch.zeros_like(height)
@@ -100,9 +139,10 @@ class VelocityPostureReward:
     lower = lower_body_score(
       q_error, foot_pos, foot_vel, linear_w, angular_w[:, 2], command
     )
-    return 0.5 * (upper + lower)
+    phase_scale = torch.where((command == 0).all(-1), 1.0, moving_scale)
+    return phase_scale * 0.5 * (upper + lower)
 
-  def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+  def __call__(self, env: ManagerBasedRlEnv, moving_scale: float = 1.0) -> torch.Tensor:
     height, quat, linear, angular_b = physical_root(env)
     robot = env.scene["robot"]
     command = env.command_manager.get_command("velocity")
@@ -114,4 +154,5 @@ class VelocityPostureReward:
       robot.data.joint_pos,
       robot.data.joint_vel,
       command,
+      moving_scale,
     )

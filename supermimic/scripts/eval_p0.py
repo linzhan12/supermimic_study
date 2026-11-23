@@ -44,6 +44,10 @@ WALK_START = (
   ("forward", 1.0, (0.35, 0.0, 0.0)),
   ("release", 2.0, (0.0, 0.0, 0.0)),
 )
+STEADY_FORWARD = (
+  ("stand", 1.0, (0.0, 0.0, 0.0)),
+  ("forward", 6.0, (0.35, 0.0, 0.0)),
+)
 ROUTES = ("motion", "reference_velocity", "scripted_velocity")
 FALL_HEIGHT_M = 0.45
 FALL_TILT_RAD = math.pi / 3
@@ -60,6 +64,7 @@ class Config:
   device: str = "cpu"
   task_id: str = "SuperMimic-GenCoord-G1"
   record_posture: bool = False
+  steady_forward: bool = False
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -77,6 +82,32 @@ def velocity_limits(cfg: VelocityTaskCfg, like: torch.Tensor) -> torch.Tensor:
   return like.new_tensor(
     (cfg.lin_vel_x_range, cfg.lin_vel_y_range, cfg.ang_vel_z_range)
   ).T
+
+
+def arm_swing_metrics(rows: list[dict], joint_names: tuple[str, ...]) -> dict:
+  names = tuple(
+    f"{side}_{joint}_pitch_joint"
+    for joint in ("shoulder", "hip")
+    for side in ("left", "right")
+  )
+  columns = [joint_names.index(name) for name in names]
+  joints = torch.tensor([r["posture"]["joint_pos_rad"] for r in rows])[:, columns]
+  arms, hips = joints.split(2, dim=-1)
+  amplitude = torch.quantile(arms, 0.95, dim=0) - torch.quantile(arms, 0.05, dim=0)
+  phase_signals = torch.stack(
+    (arms[:, 0], arms[:, 1], arms[:, 0] - arms[:, 1], hips[:, 0] - hips[:, 1])
+  )
+  corr = torch.nan_to_num(torch.corrcoef(phase_signals), nan=0.0)
+  return {
+    "steps": len(rows),
+    "shoulder_pitch_excursion_deg": torch.rad2deg(amplitude).tolist(),
+    "left_right_correlation": corr[0, 1].item(),
+    "arm_hip_difference_correlation": corr[2, 3].item(),
+    "forward_mae_mps": sum(
+      abs(r["actual_velocity"][0] - r["target_velocity"][0]) for r in rows
+    )
+    / len(rows),
+  }
 
 
 def summarize(trace: list[dict], planned_steps: int, dt: float) -> dict:
@@ -130,6 +161,8 @@ def summarize(trace: list[dict], planned_steps: int, dt: float) -> dict:
 def evaluate(cfg: Config) -> None:
   if cfg.seed < 0:
     raise ValueError("Use a nonnegative seed for paired replay.")
+  if cfg.steady_forward and not cfg.record_posture:
+    raise ValueError("The steady forward test requires --record-posture True.")
   if cfg.motion_file.suffix != ".npz" or not cfg.motion_file.is_file():
     raise ValueError("Pass one local G1 reference .npz file.")
   configure_torch_backends(allow_tf32=False, deterministic=True)
@@ -206,10 +239,13 @@ def evaluate(cfg: Config) -> None:
     sim_ctx = wm.sim_context.read(sim_env)
     env_ids = torch.zeros(1, dtype=torch.long, device=cfg.device)
     scenarios = {}
-    for case, frame, phases in (
+    case_definitions = [
       ("stand_start", cfg.stand_frame, STAND_START),
       ("walk_start", cfg.walk_frame, WALK_START),
-    ):
+    ]
+    if cfg.steady_forward:
+      case_definitions.append(("steady_forward", cfg.stand_frame, STEADY_FORWARD))
+    for case, frame, phases in case_definitions:
       schedule = []
       for phase, duration, command in phases:
         target = ref_raw.new_tensor(command)
@@ -249,7 +285,8 @@ def evaluate(cfg: Config) -> None:
     for case, (frame, schedule) in scenarios.items():
       initial = None
       case_summary = {"reference_frame": frame, "routes": {}}
-      for route in ROUTES:
+      routes = ("scripted_velocity",) if case == "steady_forward" else ROUTES
+      for route in routes:
         task = "motion" if route == "motion" else "velocity"
         actor.set_slot_mix({task: 1.0})
         sim_env.reset()
@@ -345,6 +382,10 @@ def evaluate(cfg: Config) -> None:
           for row in trace:
             stream.write(json.dumps(row, allow_nan=False) + "\n")
         result = summarize(trace, len(schedule), dt)
+        if case == "steady_forward" and result["completed"]:
+          result["arm_swing"] = arm_swing_metrics(
+            trace[-round(4.0 / dt) :], robot.joint_names
+          )
         case_summary["routes"][route] = result
         print(
           f"{case}/{route}: {len(trace)}/{len(schedule)} steps, {result['termination_reasons']}"

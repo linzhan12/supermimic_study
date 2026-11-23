@@ -6,7 +6,10 @@ from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.tasks.task_spec import build_actor_obs_td
-from supermimic.tasks.velocity_posture import VelocityPostureReward
+from supermimic.tasks.velocity_posture import (
+  VelocityArmSwingReward,
+  VelocityPostureReward,
+)
 from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
   fall_severity,
@@ -27,6 +30,13 @@ class VelocityWorldModelEnv(WorldModelEnv):
       assert isinstance(posture.func, VelocityPostureReward)
       self.posture = posture.func
       self.posture_weight = posture.weight
+      self.moving_posture_scale = posture.params.get("moving_scale", 1.0)
+    self.arm_swing = None
+    if "arm_swing" in env.cfg.rewards:
+      swing = env.unwrapped.reward_manager.get_term_cfg("arm_swing")
+      assert isinstance(swing.func, VelocityArmSwingReward)
+      self.arm_swing = swing.func
+      self.arm_swing_weight = swing.weight
 
   def _on_reset(self, batch: TensorDict) -> None:
     self.command = batch["velocity_command"]
@@ -44,8 +54,17 @@ class VelocityWorldModelEnv(WorldModelEnv):
     height = next_aux_state[..., 2]
     if self.posture is not None:
       reward = reward + self.posture_weight * self.posture.score(
-        height, quat, linear_w, angular_w, q, qd, self.command
+        height,
+        quat,
+        linear_w,
+        angular_w,
+        q,
+        qd,
+        self.command,
+        self.moving_posture_scale,
       )
+    if self.arm_swing is not None:
+      reward = reward + self.arm_swing_weight * self.arm_swing.score(q, self.command)
     severity = fall_severity(height, quat)
     done = torch.sigmoid((severity - 1.0) / self._termination_softness)
     return done, reward * self.dt

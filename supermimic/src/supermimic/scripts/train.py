@@ -41,7 +41,7 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
-from supermimic.tasks.velocity_posture import VelocityPostureReward
+from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPostureReward
 from supermimic.tasks.velocity_tracking import configure_velocity_env
 
 
@@ -122,10 +122,16 @@ def main() -> None:
   if args.runner.init_checkpoint_dir and args.runner.wandb_run_path:
     raise ValueError("Choose one checkpoint initialization source.")
   posture_weight = args.runner.posture_weight
+  moving_posture_scale = args.runner.moving_posture_scale
+  arm_swing_weight = args.runner.arm_swing_weight
   if not math.isfinite(posture_weight) or posture_weight < 0:
     raise ValueError("Posture reward weight must be finite and nonnegative.")
-  if posture_weight and not args.runner.independent_velocity:
-    raise ValueError("Posture reward requires the independent velocity task.")
+  if not 0.0 <= moving_posture_scale <= 1.0:
+    raise ValueError("Moving posture scale must be between 0 and 1.")
+  if not math.isfinite(arm_swing_weight) or arm_swing_weight < 0:
+    raise ValueError("Arm swing reward weight must be finite and nonnegative.")
+  if (posture_weight or arm_swing_weight) and not args.runner.independent_velocity:
+    raise ValueError("Posture and arm swing rewards require the independent velocity task.")
   if args.runner.independent_velocity:
     if chosen_task != "SuperMimic-GenCoord-G1" or args.runner.representation != "gencoord":
       raise ValueError("Independent velocity fine-tuning requires SuperMimic-GenCoord-G1.")
@@ -178,7 +184,14 @@ def main() -> None:
     args.runner.sampling_mode = "uniform"
     configure_velocity_env(args.env)
     if posture_weight:
-      args.env.rewards["posture"] = RewardTermCfg(func=VelocityPostureReward, weight=posture_weight)
+      args.env.rewards["posture"] = RewardTermCfg(
+        func=VelocityPostureReward, weight=posture_weight,
+        params={"moving_scale": moving_posture_scale},
+      )
+    if arm_swing_weight:
+      args.env.rewards["arm_swing"] = RewardTermCfg(
+        func=VelocityArmSwingReward, weight=arm_swing_weight,
+      )
 
   # 按最终配置、并行环境数和设备创建并包装物理仿真环境。
   # 前面对动作文件、表示和采样方式的配置应在此之前完成。
