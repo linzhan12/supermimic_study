@@ -59,6 +59,7 @@ class Config:
   seed: int = 0
   device: str = "cpu"
   task_id: str = "SuperMimic-GenCoord-G1"
+  record_posture: bool = False
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -91,6 +92,29 @@ def summarize(trace: list[dict], planned_steps: int, dt: float) -> dict:
       ],
       "double_support_fraction": sum(all(r["foot_contact"]) for r in rows) / len(rows),
     }
+    if "posture" in rows[0]:
+      posture = [row["posture"] for row in rows]
+      tail = posture[-round(0.5 / dt) :]
+      stance_speed = [
+        speed
+        for row in rows
+        for speed, contact in zip(
+          row["posture"]["foot_speed_mps"], row["foot_contact"], strict=True
+        )
+        if contact
+      ]
+      per_phase[phase].update(
+        torso_tilt_mean_deg=sum(p["torso_tilt_deg"] for p in posture) / len(posture),
+        waist_mean_abs_deg=[
+          math.degrees(sum(abs(row["waist_rad"][i]) for row in rows) / len(rows))
+          for i in range(3)
+        ],
+        tail_0_5s_standing_joint_rms_rad=sum(p["standing_joint_rms_rad"] for p in tail)
+        / len(tail),
+        stance_foot_speed_mean_mps=sum(stance_speed) / len(stance_speed)
+        if stance_speed
+        else None,
+      )
   reasons = trace[-1]["termination_reasons"]
   return {
     "planned_steps": planned_steps,
@@ -171,6 +195,13 @@ def evaluate(cfg: Config) -> None:
       robot.joint_names.index(f"waist_{axis}_joint")
       for axis in ("yaw", "roll", "pitch")
     ]
+    if cfg.record_posture:
+      foot_sites, _ = robot.find_sites(
+        tuple(name.replace("_ankle_roll_link", "_foot") for name in feet.primary_names),
+        preserve_order=True,
+      )
+      torso = robot.body_names.index("torso_link")
+      q_stand = data.default_joint_pos[0].clone()
     dt = sim_env.step_dt
     sim_ctx = wm.sim_context.read(sim_env)
     env_ids = torch.zeros(1, dtype=torch.long, device=cfg.device)
@@ -274,27 +305,40 @@ def evaluate(cfg: Config) -> None:
             if sim_env.termination_manager.get_term(name)[0].item()
           ]
           assert feet.data.found is not None
-          trace.append(
-            {
-              "step": step,
-              "command_time_s": step * dt,
-              "state_time_s": (step + 1) * dt,
-              "phase": phase,
-              "reference_frame": ref_frame,
-              "reference_velocity_unclipped": ref_raw[ref_frame].tolist(),
-              "target_velocity": target.tolist(),
-              "actor_goal": goal_at_t,
-              "actual_velocity": actual[0].tolist(),
-              "pelvis_position_w_m": data.root_link_pos_w[0].tolist(),
-              "pelvis_quaternion_wxyz": data.root_link_quat_w[0].tolist(),
-              "waist_rad": data.joint_pos[0, waist].tolist(),
-              "foot_contact": (feet.data.found[0] > 0).tolist(),
-              "executed_action": sim_env.action_manager.action[0].tolist(),
-              "joint_target_rad": data.joint_pos_target[0].tolist(),
-              "legacy_tracking_reward": reward[0].item(),
-              "termination_reasons": reasons,
+          row = {
+            "step": step,
+            "command_time_s": step * dt,
+            "state_time_s": (step + 1) * dt,
+            "phase": phase,
+            "reference_frame": ref_frame,
+            "reference_velocity_unclipped": ref_raw[ref_frame].tolist(),
+            "target_velocity": target.tolist(),
+            "actor_goal": goal_at_t,
+            "actual_velocity": actual[0].tolist(),
+            "pelvis_position_w_m": data.root_link_pos_w[0].tolist(),
+            "pelvis_quaternion_wxyz": data.root_link_quat_w[0].tolist(),
+            "waist_rad": data.joint_pos[0, waist].tolist(),
+            "foot_contact": (feet.data.found[0] > 0).tolist(),
+            "executed_action": sim_env.action_manager.action[0].tolist(),
+            "joint_target_rad": data.joint_pos_target[0].tolist(),
+            "legacy_tracking_reward": reward[0].item(),
+            "termination_reasons": reasons,
+          }
+          if cfg.record_posture:
+            torso_quat = data.body_link_quat_w[0, torso]
+            torso_tilt = 2 * torch.atan2(
+              torso_quat[1:3].norm(), torso_quat[[0, 3]].norm()
+            )
+            q = data.joint_pos[0]
+            row["posture"] = {
+              "joint_pos_rad": q.tolist(),
+              "standing_joint_rms_rad": (q - q_stand).square().mean().sqrt().item(),
+              "torso_tilt_deg": math.degrees(torso_tilt.item()),
+              "foot_speed_mps": data.site_lin_vel_w[0, foot_sites, :2]
+              .norm(dim=-1)
+              .tolist(),
             }
-          )
+          trace.append(row)
           if (terminated | truncated)[0].item():
             break
         with (cfg.output_dir / f"{case}_{route}.jsonl").open("w") as stream:

@@ -198,6 +198,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """非锚点编码器向同状态锚点潜变量对齐的损失权重；设为 0 则关闭。"""
   independent_velocity: bool = False
   """Fine-tune the velocity encoder with independent flat-ground commands."""
+  posture_weight: float = 0.0
+  """Weight for the phase-conditioned posture reward in independent velocity training."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(

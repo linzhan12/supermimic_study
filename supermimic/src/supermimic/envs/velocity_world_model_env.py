@@ -6,6 +6,7 @@ from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.tasks.task_spec import build_actor_obs_td
+from supermimic.tasks.velocity_posture import VelocityPostureReward
 from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
   fall_severity,
@@ -20,6 +21,12 @@ class VelocityWorldModelEnv(WorldModelEnv):
     assert isinstance(term, IndependentVelocityCommand)
     self.schedule = term.schedule
     self.dt = env.unwrapped.step_dt
+    self.posture = None
+    if "posture" in env.cfg.rewards:
+      posture = env.unwrapped.reward_manager.get_term_cfg("posture")
+      assert isinstance(posture.func, VelocityPostureReward)
+      self.posture = posture.func
+      self.posture_weight = posture.weight
 
   def _on_reset(self, batch: TensorDict) -> None:
     self.command = batch["velocity_command"]
@@ -30,12 +37,16 @@ class VelocityWorldModelEnv(WorldModelEnv):
   def _score_transition(
     self, next_aux_state, next_rep_state, next_joint_state, action, last_action
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, _, linear_b, angular_b, _, _ = decompose_rep_state(next_rep_state)
+    _, _, linear_b, angular_b, q, qd = decompose_rep_state(next_rep_state)
     quat = next_aux_state[..., 3:7]
-    reward = velocity_reward(
-      quat, quat_apply(quat, linear_b), quat_apply(quat, angular_b), self.command
-    )
-    severity = fall_severity(next_aux_state[..., 2], quat)
+    linear_w, angular_w = quat_apply(quat, linear_b), quat_apply(quat, angular_b)
+    reward = velocity_reward(quat, linear_w, angular_w, self.command)
+    height = next_aux_state[..., 2]
+    if self.posture is not None:
+      reward = reward + self.posture_weight * self.posture.score(
+        height, quat, linear_w, angular_w, q, qd, self.command
+      )
+    severity = fall_severity(height, quat)
     done = torch.sigmoid((severity - 1.0) / self._termination_softness)
     return done, reward * self.dt
 

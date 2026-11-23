@@ -12,6 +12,7 @@ from __future__ import annotations
 
 
 # os 提供路径相关工具；dataclass 帮我们生成保存配置所需的初始化方法。
+import math
 import os
 from dataclasses import dataclass
 
@@ -21,6 +22,7 @@ import mjlab.tasks  # noqa: F401
 import tyro
 # mjlab 环境配置类型：场景、动作、观察、奖励、结束条件等都由它组织；不是环境实例。
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers import RewardTermCfg
 # 来自 mjlab_research/src/mjlab/tasks/registry.py：list_tasks 返回已注册任务名；
 # load_env_cfg 按任务名深拷贝训练或播放配置，避免本次覆盖字段污染注册表原配置。
 from mjlab.tasks.registry import list_tasks, load_env_cfg
@@ -39,6 +41,7 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.velocity_posture import VelocityPostureReward
 from supermimic.tasks.velocity_tracking import configure_velocity_env
 
 
@@ -118,6 +121,11 @@ def main() -> None:
 
   if args.runner.init_checkpoint_dir and args.runner.wandb_run_path:
     raise ValueError("Choose one checkpoint initialization source.")
+  posture_weight = args.runner.posture_weight
+  if not math.isfinite(posture_weight) or posture_weight < 0:
+    raise ValueError("Posture reward weight must be finite and nonnegative.")
+  if posture_weight and not args.runner.independent_velocity:
+    raise ValueError("Posture reward requires the independent velocity task.")
   if args.runner.independent_velocity:
     if chosen_task != "SuperMimic-GenCoord-G1" or args.runner.representation != "gencoord":
       raise ValueError("Independent velocity fine-tuning requires SuperMimic-GenCoord-G1.")
@@ -169,6 +177,8 @@ def main() -> None:
     args.runner.latent_bc_weight = 0.0
     args.runner.sampling_mode = "uniform"
     configure_velocity_env(args.env)
+    if posture_weight:
+      args.env.rewards["posture"] = RewardTermCfg(func=VelocityPostureReward, weight=posture_weight)
 
   # 按最终配置、并行环境数和设备创建并包装物理仿真环境。
   # 前面对动作文件、表示和采样方式的配置应在此之前完成。
