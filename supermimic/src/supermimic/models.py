@@ -330,12 +330,7 @@ class MultiEncoderAE(nn.Module):
       if lo == hi:
         continue
       goal = obs_td[f"goal_{name}"][lo:hi]
-      goal_n = self.goal_normalizers[name](goal)
-      encoded = self.encoders[name](goal_n)
-      if name == "velocity" and self.stop_encoder is not None:
-        blend = torch.exp(-(goal / goal.new_tensor((0.06, 0.06, 0.12))).square().sum(-1, keepdim=True))
-        encoded = encoded.lerp(self.stop_encoder(goal_n), blend)
-      enc_outs.append(encoded)
+      enc_outs.append(self._encode_goal(name, goal))
 
     # 前向时缓存逐样本辅助损失，policy learner 在本步调用 auxiliary_loss 将其纳入目标。
     self._aux_loss = self._compute_aux_loss(obs_td, slots)
@@ -350,13 +345,42 @@ class MultiEncoderAE(nn.Module):
       if lo < hi:
         adjusted = actions[lo:hi]
         command = obs_td["goal_velocity"][lo:hi]
-        if self.arm_swing_control is not None:
-          adjusted = self.arm_swing_control(adjusted, obs_td["history"][lo:hi, -1], command)
-        if self.forward_gait_adapter is not None:
-          phase = obs_td["gait_phase"][lo:hi] if self.forward_gait_adapter.use_phase else None
-          adjusted = self.forward_gait_adapter(adjusted, history_n[lo:hi, -1], command, phase)
+        raw = obs_td["history"][lo:hi]
+        adapter = self.forward_gait_adapter
+        phase = obs_td["gait_phase"][lo:hi] if adapter is not None and adapter.use_phase else None
+        adjusted = self._adjust_velocity_action(adjusted, raw, history_n[lo:hi], command, phase)
+        reflection = adapter.reflection if adapter is not None else None
+        if reflection is not None:
+          reflected_history = reflection.state(raw)
+          reflected_norm = self.obs_normalizer(reflected_history)
+          reflected_command = command * reflection.command_sign
+          latent = self._encode_goal("velocity", reflected_command).tanh()
+          reflected_action = self.decoder(torch.cat((latent, reflected_norm.flatten(1)), dim=-1))
+          assert phase is not None
+          reflected_action = self._adjust_velocity_action(
+            reflected_action, reflected_history, reflected_norm, reflected_command, phase + 0.5
+          )
+          adjusted = adjusted.lerp(reflection.action(reflected_action), reflection.weight(command))
         actions = torch.cat((actions[:lo], adjusted, actions[hi:]), dim=0)
     return actions
+
+  def _encode_goal(self, name: str, goal: torch.Tensor) -> torch.Tensor:
+    goal_n = self.goal_normalizers[name](goal)
+    encoded = self.encoders[name](goal_n)
+    if name == "velocity" and self.stop_encoder is not None:
+      distance = (goal / goal.new_tensor((0.06, 0.06, 0.12))).square().sum(-1, keepdim=True)
+      encoded = encoded.lerp(self.stop_encoder(goal_n), torch.exp(-distance))
+    return encoded
+
+  def _adjust_velocity_action(
+    self, action: torch.Tensor, raw: torch.Tensor, normalized: torch.Tensor,
+    command: torch.Tensor, phase: torch.Tensor | None,
+  ) -> torch.Tensor:
+    if self.arm_swing_control is not None:
+      action = self.arm_swing_control(action, raw[:, -1], command)
+    if self.forward_gait_adapter is not None:
+      action = self.forward_gait_adapter(action, normalized[:, -1], command, phase)
+    return action
 
   # 函数作用：计算非锚点任务的潜变量模仿损失，返回逐样本 [B]。
   def _compute_aux_loss(

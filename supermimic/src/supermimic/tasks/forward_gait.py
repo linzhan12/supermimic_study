@@ -209,6 +209,7 @@ class ForwardGaitAdapter(nn.Module):
     )
     nn.init.zeros_(self.net[-1].weight)
     nn.init.zeros_(self.net[-1].bias)
+    self.reflection: G1SagittalReflection | None = None
 
   def forward(
     self,
@@ -224,6 +225,71 @@ class ForwardGaitAdapter(nn.Module):
     delta = self.net(torch.cat(features, dim=-1)).tanh()
     delta = delta * self.limits * forward_gait_gate(command)[..., None]
     return action.index_add(-1, self.indices, delta)
+
+
+class G1SagittalReflection(nn.Module):
+  """Convert state and joint targets between mirrored G1 walking problems."""
+
+  def __init__(
+    self,
+    joint_names: list[str],
+    action_names: tuple[str, ...],
+    scale: torch.Tensor,
+    offset: torch.Tensor,
+    blend: float,
+  ) -> None:
+    super().__init__()
+    self.blend = blend
+    for attr, names in (("joint", tuple(joint_names)), ("action", action_names)):
+      counterparts = []
+      for name in names:
+        if name.startswith("left_"):
+          partner = "right_" + name.removeprefix("left_")
+        elif name.startswith("right_"):
+          partner = "left_" + name.removeprefix("right_")
+        else:
+          partner = name
+        counterparts.append(names.index(partner))
+      signs = scale.new_tensor(
+        [-1 if "_roll_" in name or "_yaw_" in name else 1 for name in names]
+      )
+      self.register_buffer(
+        f"{attr}_permutation",
+        torch.tensor(counterparts, device=scale.device),
+        persistent=False,
+      )
+      self.register_buffer(f"{attr}_sign", signs, persistent=False)
+    self.register_buffer("scale", scale.reshape(-1).clone(), persistent=False)
+    self.register_buffer("offset", offset.reshape(-1).clone(), persistent=False)
+    self.register_buffer(
+      "root_sign",
+      scale.new_tensor((1, 1, -1, 1, 1, -1, 1, -1, 1, -1)),
+      persistent=False,
+    )
+    self.register_buffer(
+      "command_sign", scale.new_tensor((1, -1, -1)), persistent=False
+    )
+
+  def state(self, observation: torch.Tensor) -> torch.Tensor:
+    root, q, qd = observation.split(
+      (10, len(self.joint_sign), len(self.joint_sign)), dim=-1
+    )
+    return torch.cat(
+      (
+        root * self.root_sign,
+        q.index_select(-1, self.joint_permutation) * self.joint_sign,
+        qd.index_select(-1, self.joint_permutation) * self.joint_sign,
+      ),
+      dim=-1,
+    )
+
+  def action(self, action: torch.Tensor) -> torch.Tensor:
+    position = action * self.scale + self.offset
+    mirrored = position.index_select(-1, self.action_permutation) * self.action_sign
+    return (mirrored - self.offset) / self.scale
+
+  def weight(self, command: torch.Tensor) -> torch.Tensor:
+    return 0.5 * self.blend * forward_gait_gate(command)[..., None]
 
 
 def warm_start_gait_adapter(

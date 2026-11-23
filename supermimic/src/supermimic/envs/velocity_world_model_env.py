@@ -5,6 +5,7 @@ from mjlab.utils.lab_api.math import quat_apply
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.tasks.forward_foot_cycle import ForwardFootCycleReward
 from supermimic.tasks.forward_gait import ForwardGaitPrior
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.tasks.velocity_posture import (
@@ -15,6 +16,7 @@ from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
   advance_gait_phase,
   fall_severity,
+  forward_precision_reward,
   gait_phase_features,
   turn_tracking_reward,
   velocity_reward,
@@ -32,6 +34,11 @@ class VelocityWorldModelEnv(WorldModelEnv):
     self.turn_tracking_weight = (
       env.cfg.rewards["turn_tracking"].weight
       if "turn_tracking" in env.cfg.rewards
+      else 0.0
+    )
+    self.forward_precision_weight = (
+      env.cfg.rewards["forward_precision"].weight
+      if "forward_precision" in env.cfg.rewards
       else 0.0
     )
     self.posture = None
@@ -53,6 +60,12 @@ class VelocityWorldModelEnv(WorldModelEnv):
       assert isinstance(gait.func, ForwardGaitPrior)
       self.forward_gait = gait.func
       self.forward_gait_weight = gait.weight
+    self.forward_foot_cycle = None
+    if "forward_foot_cycle" in env.cfg.rewards:
+      foot_cycle = env.unwrapped.reward_manager.get_term_cfg("forward_foot_cycle")
+      assert isinstance(foot_cycle.func, ForwardFootCycleReward)
+      self.forward_foot_cycle = foot_cycle.func
+      self.forward_foot_cycle_weight = foot_cycle.weight
 
   def _on_reset(self, batch: TensorDict) -> None:
     self.command = batch["velocity_command"]
@@ -68,6 +81,10 @@ class VelocityWorldModelEnv(WorldModelEnv):
     quat = next_aux_state[..., 3:7]
     linear_w, angular_w = quat_apply(quat, linear_b), quat_apply(quat, angular_b)
     reward = velocity_reward(quat, linear_w, angular_w, self.command)
+    if self.forward_precision_weight:
+      reward = reward + self.forward_precision_weight * forward_precision_reward(
+        quat, linear_w, angular_w, self.command
+      )
     if self.turn_tracking_weight:
       reward = reward + self.turn_tracking_weight * turn_tracking_reward(
         angular_w[..., 2], self.command
@@ -86,12 +103,17 @@ class VelocityWorldModelEnv(WorldModelEnv):
       )
     if self.arm_swing is not None:
       reward = reward + self.arm_swing_weight * self.arm_swing.score(q, self.command)
+    next_phase = None
+    if self.gait_phase is not None:
+      next_phase = advance_gait_phase(self.gait_phase, self.command, self.dt)
     if self.forward_gait is not None:
-      next_phase = None
-      if self.gait_phase is not None:
-        next_phase = advance_gait_phase(self.gait_phase, self.command, self.dt)
       reward = reward + self.forward_gait_weight * self.forward_gait.score(
         height, q, qd, self.command, next_phase
+      )
+    if self.forward_foot_cycle is not None:
+      assert next_phase is not None
+      reward = reward + self.forward_foot_cycle_weight * self.forward_foot_cycle.score(
+        height, quat, linear_w, angular_w, q, qd, self.command, next_phase
       )
     severity = fall_severity(height, quat)
     done = torch.sigmoid((severity - 1.0) / self._termination_softness)

@@ -124,6 +124,7 @@ def metrics(
     ],
     "mean_heading_velocity": speed.mean(0).tolist(),
     "double_support_fraction": float(contact.all(axis=1).mean()),
+    "no_support_fraction": float((~contact.any(axis=1)).mean()),
     "alternating_touchdown_interval_s": [n * dt for n in alternating],
     "excursion_p95_minus_p05_deg": {
       part: np.rad2deg(

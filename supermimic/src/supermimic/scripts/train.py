@@ -41,9 +41,14 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.forward_foot_cycle import ForwardFootCycleReward
 from supermimic.tasks.forward_gait import ForwardGaitPrior
 from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPostureReward
-from supermimic.tasks.velocity_tracking import configure_velocity_env, physical_turn_tracking_reward
+from supermimic.tasks.velocity_tracking import (
+  configure_velocity_env,
+  physical_forward_precision_reward,
+  physical_turn_tracking_reward,
+)
 
 
 # @dataclass 为配置类自动生成初始化方法；类可以理解为配置对象的模板。
@@ -132,16 +137,28 @@ def main() -> None:
   gait_fraction = args.runner.forward_gait_command_fraction
   gait_phase = args.runner.forward_gait_phase
   teacher_steps = args.runner.forward_gait_teacher_steps
+  foot_cycle_weight = args.runner.forward_foot_cycle_weight
+  gait_reflection = args.runner.forward_gait_reflection
+  precision_weight = args.runner.forward_precision_weight
+  gait_hold_s = args.runner.forward_gait_hold_s
   if not math.isfinite(gait_weight) or gait_weight < 0:
     raise ValueError("Forward gait reward weight must be finite and nonnegative.")
   if not 0 <= gait_limit <= 0.7 or not 0 <= gait_fraction <= 1:
     raise ValueError("Forward gait action limit must be in [0, 0.7] and fraction in [0, 1].")
-  if (gait_limit or gait_fraction or gait_weight) and not args.runner.independent_velocity:
+  if (gait_limit or gait_fraction or gait_weight or precision_weight) and not args.runner.independent_velocity:
     raise ValueError("Forward gait shaping requires the independent velocity task.")
+  if not math.isfinite(precision_weight) or precision_weight < 0:
+    raise ValueError("Forward precision weight must be finite and nonnegative.")
+  if gait_hold_s is not None and (not gait_fraction or not all(math.isfinite(t) for t in gait_hold_s)):
+    raise ValueError("A walking hold interval requires extra forward commands and finite bounds.")
   if gait_phase and (not gait_limit or not gait_weight):
     raise ValueError("Phase-conditioned walking requires the gait adapter and reward.")
+  if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
+    raise ValueError("Walking reflection requires a [0, 1] blend and phase-conditioned walking.")
   if teacher_steps < 0 or (teacher_steps and not gait_phase):
     raise ValueError("Teacher updates require phase-conditioned walking and a nonnegative count.")
+  if not math.isfinite(foot_cycle_weight) or foot_cycle_weight < 0 or (foot_cycle_weight and not gait_phase):
+    raise ValueError("Foot cycle weight must be finite, nonnegative and used with phase-conditioned walking.")
   if gait_limit and args.runner.actor_obs != "rep_state":
     raise ValueError("The experimental gait adapter requires rep_state observations.")
   if not math.isfinite(posture_weight) or posture_weight < 0:
@@ -218,9 +235,19 @@ def main() -> None:
     args.runner.slot_mix = {"motion": 0.0, "velocity": 1.0}
     args.runner.latent_bc_weight = 0.0
     args.runner.sampling_mode = "uniform"
-    configure_velocity_env(args.env, gait_fraction=gait_fraction, gait_phase=gait_phase)
+    configure_velocity_env(
+      args.env, gait_fraction=gait_fraction, gait_phase=gait_phase, gait_hold_s=gait_hold_s
+    )
+    if precision_weight:
+      args.env.rewards["forward_precision"] = RewardTermCfg(
+        func=physical_forward_precision_reward, weight=precision_weight
+      )
     if gait_weight:
       args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)
+    if foot_cycle_weight:
+      args.env.rewards["forward_foot_cycle"] = RewardTermCfg(
+        func=ForwardFootCycleReward, weight=foot_cycle_weight
+      )
     if posture_weight:
       args.env.rewards["posture"] = RewardTermCfg(
         func=VelocityPostureReward, weight=posture_weight,

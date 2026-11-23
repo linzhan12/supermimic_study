@@ -52,6 +52,22 @@ def forward_gait_gate(command: torch.Tensor) -> torch.Tensor:
   )
 
 
+def forward_precision_reward(quat, linear_w, angular_w, command):
+  error = heading_velocity(quat, linear_w, angular_w) - command
+  error = error / command.new_tensor((0.13, 0.14, 0.28))
+  return forward_gait_gate(command) / (1 + error.square().sum(-1))
+
+
+def physical_forward_precision_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
+  _, quat, linear_w, angular_b = physical_root(env)
+  return forward_precision_reward(
+    quat,
+    linear_w,
+    quat_apply(quat, angular_b),
+    env.command_manager.get_command("velocity"),
+  )
+
+
 GAIT_START_PHASE = 0.25
 
 
@@ -82,6 +98,7 @@ class VelocitySchedule:
     device: str,
     hold_s: tuple[float, float] = (1.0, 2.0),
     gait_fraction: float = 0.0,
+    gait_hold_s: tuple[float, float] | None = None,
   ):
     self.min_steps = max(1, math.ceil(hold_s[0] / dt))
     self.max_steps = math.floor(hold_s[1] / dt)
@@ -90,6 +107,12 @@ class VelocitySchedule:
     self.lower = torch.tensor((-0.2, -0.25, -0.55), device=device)
     self.upper = torch.tensor((0.55, 0.25, 0.55), device=device)
     self.gait_fraction = gait_fraction
+    self.gait_steps = None
+    if gait_hold_s is not None:
+      first, last = math.ceil(gait_hold_s[0] / dt), math.floor(gait_hold_s[1] / dt)
+      if first < 1 or first > last:
+        raise ValueError("Walking hold interval must contain a positive whole step.")
+      self.gait_steps = (first, last)
     # Categories are zero, forward-only, lateral-only, yaw-only, diagonal,
     # and walking with yaw. Reserve two of the seven draws for exact zero.
     self.masks = torch.tensor(
@@ -112,6 +135,10 @@ class VelocitySchedule:
       )
       category = torch.where(walking, 1, category)
     steps = torch.randint(self.min_steps, self.max_steps + 1, (count,), device=device)
+    if self.gait_fraction and self.gait_steps is not None:
+      first, last = self.gait_steps
+      gait_steps = torch.randint(first, last + 1, (count,), device=device)
+      steps = torch.where(walking, gait_steps, steps)
     return command, steps, category
 
   def advance(self, command, steps, category, elapsed=1):
@@ -129,7 +156,11 @@ class IndependentVelocityCommand(CommandTerm):
   def __init__(self, cfg: CommandTermCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
     self.schedule = VelocitySchedule(
-      env.step_dt, self.device, cfg.resampling_time_range, cfg.gait_fraction
+      env.step_dt,
+      self.device,
+      cfg.resampling_time_range,
+      cfg.gait_fraction,
+      cfg.gait_hold_s,
     )
     self._command = torch.zeros((self.num_envs, 3), device=self.device)
     self.steps_left = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -176,6 +207,7 @@ class IndependentVelocityCommandCfg(CommandTermCfg):
   resampling_time_range: tuple[float, float] = (1.0, 2.0)
   gait_fraction: float = 0.0
   gait_phase: bool = False
+  gait_hold_s: tuple[float, float] | None = None
 
   def build(self, env: ManagerBasedRlEnv) -> IndependentVelocityCommand:
     return IndependentVelocityCommand(self, env)
@@ -258,7 +290,10 @@ def physical_fall(env: ManagerBasedRlEnv) -> torch.Tensor:
 
 
 def configure_velocity_env(
-  cfg: ManagerBasedRlEnvCfg, gait_fraction: float = 0.0, gait_phase: bool = False
+  cfg: ManagerBasedRlEnvCfg,
+  gait_fraction: float = 0.0,
+  gait_phase: bool = False,
+  gait_hold_s: tuple[float, float] | None = None,
 ) -> None:
   reference = cfg.commands["motion"]
   assert isinstance(reference, MotionCommandCfg)
@@ -272,7 +307,7 @@ def configure_velocity_env(
   reset_command.joint_position_range = (0.0, 0.0)
   cfg.commands["motion"] = reset_command
   cfg.commands["velocity"] = IndependentVelocityCommandCfg(
-    gait_fraction=gait_fraction, gait_phase=gait_phase
+    gait_fraction=gait_fraction, gait_phase=gait_phase, gait_hold_s=gait_hold_s
   )
   cfg.episode_length_s = 10.0
   cfg.is_finite_horizon = False

@@ -51,8 +51,11 @@ def check_gait(candidate: Path) -> tuple[list[str], dict]:
     mae = mean(abs(row["actual_velocity"][0] - target) for row in rows)
     if mae > 0.10:
       failures.append(f"{case} forward MAE {mae:.3f} m/s above 0.10")
-    if min(stats["excursion_p95_minus_p05_deg"]["knee"]) < 18:
-      failures.append(f"{case} one or more knees move less than 18 degrees")
+    knees = stats["excursion_p95_minus_p05_deg"]["knee"]
+    if not all(18 <= angle <= 70 for angle in knees):
+      failures.append(f"{case} one or more knee excursions outside 18–70 degrees")
+    if stats["no_support_fraction"] > 0.10:
+      failures.append(f"{case} both feet off the ground for more than 10% of walking")
     feet = stats["feet"]
     counts = [foot["complete_swings"] for foot in feet.values()]
     if min(counts) < 2 or min(counts) < 0.6 * max(counts):
@@ -68,10 +71,13 @@ def check_gait(candidate: Path) -> tuple[list[str], dict]:
         failures.append(
           f"{case}/{side} median forward landing gap {gap:.3f} m too short"
         )
-      if clearance < 0.008:
+      if not 0.008 <= clearance <= 0.10:
         failures.append(
-          f"{case}/{side} median swing clearance {clearance:.3f} m below 0.008"
+          f"{case}/{side} median swing clearance {clearance:.3f} m outside 0.008–0.10"
         )
+      slip = foot["interior_contact_site_speed_p90_mps"]
+      if slip is None or slip > 0.25:
+        failures.append(f"{case}/{side} high or unmeasured support-foot site motion")
   if (
     len(measured) == len(STEADY)
     and min(b - a for a, b in zip(measured[:-1], measured[1:], strict=True)) < 0.07

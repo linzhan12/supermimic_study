@@ -86,7 +86,11 @@ from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerC
 # MultiEncoderAE 为各任务编码目标，再用共享解码器输出动作；build_mlp 构造普通张量 MLP。
 # 这里的 build_mlp 用于当前 runner 的 critic，与基类返回 MLPModel 的 _build_mlp 不同。
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
-from supermimic.tasks.forward_gait import ForwardGaitAdapter, warm_start_gait_adapter
+from supermimic.tasks.forward_gait import (
+  ForwardGaitAdapter,
+  G1SagittalReflection,
+  warm_start_gait_adapter,
+)
 # 来自 supermimic/src/supermimic/replay_buffer.py：FieldSpec 描述单字段宽度与类型，
 # ReplayBuffer 为每个物理环境维护独立时间环，提供不跨回合的连续窗口和历史起点采样。
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -228,6 +232,14 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Condition straight walking and its imitation reward on a continuous gait phase."""
   forward_gait_teacher_steps: int = 0
   """Supervised warm-start updates from the frozen full-reference policy."""
+  forward_foot_cycle_weight: float = 0.0
+  """Weight for phase-aligned alternation, clearance and placement of the feet."""
+  forward_gait_reflection: float = 0.0
+  """Blend straight-walking actions with half-cycle reflected state feedback."""
+  forward_precision_weight: float = 0.0
+  """Additional tight velocity tracking for straight walking."""
+  forward_gait_hold_s: tuple[float, float] | None = None
+  """Override the hold interval for added forward-walking commands."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -417,6 +429,13 @@ def build_actor(
       obs_dim, wm.action_names, wm.dynamics.action_scale, cfg.forward_gait_action_limit,
       use_phase=cfg.forward_gait_phase,
     )
+    if cfg.forward_gait_reflection:
+      if not isinstance(representation, GenCoordRepresentation):
+        raise ValueError("Walking reflection requires G1 GenCoord state.")
+      gait_adapter.reflection = G1SagittalReflection(
+        representation.fk.joint_names, wm.action_names, wm.dynamics.action_scale,
+        wm.dynamics.action_offset, cfg.forward_gait_reflection,
+      )
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
