@@ -68,6 +68,9 @@ class G1ArmSwingControl(nn.Module):
     action_names: tuple[str, ...],
     scale: torch.Tensor,
     gain: float,
+    offset: torch.Tensor | None = None,
+    roll: float = 0.0,
+    speed_gate: float = 0.0,
   ) -> None:
     super().__init__()
     self.hips = tuple(
@@ -80,16 +83,38 @@ class G1ArmSwingControl(nn.Module):
     self.register_buffer("shoulders", columns, persistent=False)
     self.register_buffer("scale", scale.reshape(-1)[columns].clone(), persistent=False)
     self.gain = gain
+    self.roll = roll
+    self.speed_gate = speed_gate
+    if roll:
+      roll_columns = torch.tensor(
+        [
+          action_names.index(f"{side}_shoulder_roll_joint")
+          for side in ("left", "right")
+        ],
+        device=scale.device,
+      )
+      assert offset is not None
+      roll_target = (
+        scale.new_tensor((roll, -roll)) - offset.reshape(-1)[roll_columns]
+      ) / scale.reshape(-1)[roll_columns]
+      self.register_buffer("roll_columns", roll_columns, persistent=False)
+      self.register_buffer("roll_target", roll_target, persistent=False)
 
   def forward(self, action: torch.Tensor, state: torch.Tensor, command: torch.Tensor):
-    _, _, _, _, q, qd = decompose_rep_state(state)
+    _, _, linear_b, _, q, qd = decompose_rep_state(state)
     left, right = self.hips
     phase = q[..., left] - q[..., right] + 0.06 * (qd[..., left] - qd[..., right])
     swing = 0.33 * torch.tanh(phase / 0.20)
     target = torch.stack((-swing, swing), dim=-1) / self.scale
     blend = self.gain * forward_swing_gate(command)[..., None]
+    if self.speed_gate:
+      blend = blend * ((linear_b[..., :1] - self.speed_gate) / 0.16).clamp(0, 1)
     shoulders = action.index_select(-1, self.shoulders).lerp(target, blend)
-    return action.index_copy(-1, self.shoulders, shoulders)
+    action = action.index_copy(-1, self.shoulders, shoulders)
+    if self.roll:
+      rolls = action.index_select(-1, self.roll_columns).lerp(self.roll_target, blend)
+      action = action.index_copy(-1, self.roll_columns, rolls)
+    return action
 
 
 class VelocityArmSwingReward:

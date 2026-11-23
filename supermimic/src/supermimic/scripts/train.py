@@ -134,6 +134,18 @@ def main() -> None:
     raise ValueError("Arm swing reward weight must be finite and nonnegative.")
   if not 0 <= arm_swing_control <= 1:
     raise ValueError("Arm swing control must be between 0 and 1.")
+  if not 0 <= args.runner.arm_swing_roll <= 0.45:
+    raise ValueError("Arm swing shoulder roll must be between 0 and 0.45 radians.")
+  if args.runner.arm_swing_roll and not arm_swing_control:
+    raise ValueError("An outward shoulder target requires arm swing control.")
+  if not 0 <= args.runner.arm_swing_speed_gate <= 0.35:
+    raise ValueError("Arm swing speed gate must be between 0 and 0.35 m/s.")
+  if args.runner.arm_swing_speed_gate and not arm_swing_control:
+    raise ValueError("An arm swing speed gate requires arm swing control.")
+  if args.runner.stop_encoder_init_dir and not args.runner.independent_velocity:
+    raise ValueError("A separate stop encoder requires independent velocity training.")
+  if args.runner.stop_encoder_init_dir and not args.runner.init_checkpoint_dir:
+    raise ValueError("A separate stop encoder requires a local moving-policy checkpoint.")
   if not math.isfinite(turn_tracking_weight) or turn_tracking_weight < 0:
     raise ValueError("Turn tracking weight must be finite and nonnegative.")
   if (posture_weight or arm_swing_weight or arm_swing_control or turn_tracking_weight) and not args.runner.independent_velocity:

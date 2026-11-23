@@ -12,6 +12,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 # PyTorch 张量、随机采样、设备和自动微分工具；计算沿最后一维组织特征，前导轴保留批次/时间。
+import copy
+
 import torch
 # Module、ModuleDict、Sequential 负责注册网络与缓冲；注册后设备迁移和 state_dict 才能统一管理。
 import torch.nn as nn
@@ -210,6 +212,7 @@ class MultiEncoderAE(nn.Module):
     latent_bc_weight: float,
     history_length: int,
     arm_swing_control: nn.Module | None = None,
+    separate_stop_encoder: bool = False,
   ):
     """为任务建立目标编码器、归一化器和共享动作解码器。
 
@@ -250,6 +253,7 @@ class MultiEncoderAE(nn.Module):
         for ts in task_specs
       }
     )
+    self.stop_encoder = copy.deepcopy(self.encoders["velocity"]) if separate_stop_encoder else None
     # 解码器只接收统一宽度的潜变量和历史，因此不同目标模态可以共享动作生成参数。
     self.decoder = build_mlp(
       latent_dim + history_length * obs_dim,
@@ -323,8 +327,13 @@ class MultiEncoderAE(nn.Module):
       # 占比为零或因小批次取整得到空区间时跳过，避免对空张量执行编码计算。
       if lo == hi:
         continue
-      goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
-      enc_outs.append(self.encoders[name](goal_n))
+      goal = obs_td[f"goal_{name}"][lo:hi]
+      goal_n = self.goal_normalizers[name](goal)
+      encoded = self.encoders[name](goal_n)
+      if name == "velocity" and self.stop_encoder is not None:
+        blend = torch.exp(-(goal / goal.new_tensor((0.06, 0.06, 0.12))).square().sum(-1, keepdim=True))
+        encoded = encoded.lerp(self.stop_encoder(goal_n), blend)
+      enc_outs.append(encoded)
 
     # 前向时缓存逐样本辅助损失，policy learner 在本步调用 auxiliary_loss 将其纳入目标。
     self._aux_loss = self._compute_aux_loss(obs_td, slots)

@@ -207,6 +207,14 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Weight for contralateral arm swing during forward walking."""
   arm_swing_control: float = 0.0
   """Blend weight of phase-driven G1 shoulder targets in the velocity branch."""
+  arm_swing_roll: float = 0.0
+  """Symmetric outward shoulder roll target for phase-driven walking, in radians."""
+  arm_swing_speed_gate: float = 0.0
+  """Positive forward speed at which phase-driven shoulder targets start ramping in."""
+  stop_encoder_init_dir: str | None = None
+  """Initialize a separate near-zero velocity encoder from a local checkpoint."""
+  freeze_moving_encoder: bool = True
+  """Freeze the original velocity encoder when a separate stop encoder is present."""
   turn_tracking_weight: float = 0.0
   """Additional narrow yaw tracking reward on turning commands."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
@@ -388,7 +396,9 @@ def build_actor(
     if not isinstance(representation, GenCoordRepresentation) or cfg.actor_obs != "rep_state":
       raise ValueError("Arm swing control requires G1 GenCoord rep_state observations.")
     arm_control = G1ArmSwingControl(
-      representation.fk.joint_names, wm.action_names, wm.dynamics.action_scale, cfg.arm_swing_control
+      representation.fk.joint_names, wm.action_names, wm.dynamics.action_scale, cfg.arm_swing_control,
+      offset=wm.dynamics.action_offset, roll=cfg.arm_swing_roll,
+      speed_gate=cfg.arm_swing_speed_gate,
     )
   return MultiEncoderAE(
     obs_dim=obs_dim,
@@ -400,6 +410,7 @@ def build_actor(
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
     arm_swing_control=arm_control,
+    separate_stop_encoder=cfg.stop_encoder_init_dir is not None,
   ).to(device)
 
 
@@ -997,11 +1008,23 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     actor = build_actor(self.cfg, self._wm, self.device)
     if self.cfg.init_checkpoint_dir is not None:
       path = Path(self.cfg.init_checkpoint_dir).expanduser() / "actor.pt"
-      actor.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+      state = torch.load(path, map_location=self.device, weights_only=True)
+      if self.cfg.stop_encoder_init_dir is not None and "stop_encoder.0.weight" not in state:
+        stop_path = Path(self.cfg.stop_encoder_init_dir).expanduser() / "actor.pt"
+        source = torch.load(stop_path, map_location=self.device, weights_only=True)
+        prefix = "encoders.velocity."
+        state.update({
+          f"stop_encoder.{name.removeprefix(prefix)}": value
+          for name, value in source.items() if name.startswith(prefix)
+        })
+      actor.load_state_dict(state)
     self._velocity_command = None
     if self.cfg.independent_velocity:
       actor.requires_grad_(False)
-      actor.encoders["velocity"].requires_grad_(True)
+      if actor.stop_encoder is not None:
+        actor.stop_encoder.requires_grad_(True)
+      if actor.stop_encoder is None or not self.cfg.freeze_moving_encoder:
+        actor.encoders["velocity"].requires_grad_(True)
       term = self.env.unwrapped.command_manager.get_term("velocity")
       assert isinstance(term, IndependentVelocityCommand)
       self._velocity_command = term

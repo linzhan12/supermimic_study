@@ -19,7 +19,9 @@ from tests.conftest import (
 BATCH = 16
 
 
-def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
+def _make_actor(
+  slot_mix=None, history_length: int = 1, separate_stop_encoder=False
+) -> MultiEncoderAE:
   return MultiEncoderAE(
     obs_dim=OBS_DIM,
     action_dim=ACTION_DIM,
@@ -29,6 +31,7 @@ def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
     hidden_dims=(32, 32),
     latent_bc_weight=1.0,
     history_length=history_length,
+    separate_stop_encoder=separate_stop_encoder,
   )
 
 
@@ -70,6 +73,19 @@ class TestForwardShape:
 
 
 class TestSlotRouting:
+  def test_separate_stop_encoder_leaves_motion_and_ordinary_commands_intact(self):
+    actor = _make_actor(separate_stop_encoder=True).eval()
+    obs = make_actor_obs(BATCH)
+    obs["goal_velocity"][:] = torch.tensor([0.35, 0.0, 0.0])
+    obs["goal_velocity"][-1] = 0.0
+    baseline = actor(obs).detach()
+    assert actor.stop_encoder is not None
+    with torch.no_grad():
+      actor.stop_encoder[-1].bias.add_(0.5)
+    updated = actor(obs).detach()
+    torch.testing.assert_close(baseline[:-1], updated[:-1], rtol=0, atol=0)
+    assert not torch.allclose(baseline[-1], updated[-1])
+
   def test_motion_slot_isolation(self):
     """Changing velocity slot goals doesn't affect motion slot outputs."""
     actor = _make_actor()
