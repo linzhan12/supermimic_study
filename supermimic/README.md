@@ -35,12 +35,31 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
   <TASK_ID> --runner.run_name <description>
 ```
 
-Play back a trained model:
+Play back a checkpoint stored in W&B:
 
 ```bash
 uv run src/supermimic/scripts/play.py \
   <TASK_ID> --wandb-path <RUN_PATH>
 ```
+
+### Local visual playback
+
+Open a saved local checkpoint in your browser using the installed environment.
+The player reads `actor.pt`, `world_model.pt`, and `local_config.json` when
+present. Provide a local reference clip for playback. The browser player works
+without a W&B account or network connection.
+
+```bash
+OMP_NUM_THREADS=2 .venv/bin/python -u scripts/play_speed_test.py \
+  --checkpoint-dir logs/SuperMimic-GenCoord-G1/2026-11-23_16-07-37 \
+  --motion-file ../data/lafan1_official/walk1_subject1.npz \
+  --device cpu --start-paused True --num-steps-rollout 32
+```
+
+Open the printed `Local playback` URL in a browser on the same machine. Click
+**Play** and adjust **Velocity Command → Lin Vel X (m/s)** to see a forward
+command. Select **Task → motion** to view full-reference tracking. Keep the
+terminal open during playback and press Ctrl+C to stop the viewer.
 
 ### P0 paired replay on flat ground
 
