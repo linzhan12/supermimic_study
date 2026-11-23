@@ -59,3 +59,62 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
 用通过原速度门槛的 F1 encoder 初始化移动分支，用已通过停步门槛的 F2 `0.25` encoder 初始化近零速分支。根据指令接近零的程度平滑混合二者的潜变量，固定移动 encoder 和共享 decoder，只微调停步 encoder。持续直走时，步态肩控同时给左右肩对称的 `±0.28 rad` 外展目标。该配置改变了速度分支结构，所有原闭环门槛及摆臂门槛保持相同，作为 F2 内的工程对照记录。
 
 初始化探针的摆幅为 `39.33° / 22.04°`，左右相关 `−0.983`，肩差与髋差相关 `−0.833`。但稳态直走 MAE 为 `0.1541 m/s`，初始化探针也有四项原速度超差。联合训练改用 `±0.26 rad` 外展、`0.55` 的肩部混合系数，并让肩控从实测前向速度 `0.12 m/s` 起在 `0.16 m/s` 的区间内逐步介入。移动与停步 encoder 都以较小的学习率微调，从而让身体适应肩部动作，共享 decoder 和完整参考 encoder 保持冻结。
+
+运行 `2026-11-23_17-18-49` 用 `4×10⁻⁵` 学习率训练 1,800 次，移动姿态倍率 `0.10`、转向奖励 `0.08`。左右肩 `10.04° / 12.86°`，持续前进 MAE `0.0344 m/s`，但肩差与髋差相关 `−0.239`，并有五项速度超差。停步关节 RMS 改善 `16.0%`，未过门槛。
+
+较弱肩控的初始化探针将混合系数降至 `0.45`，保留 `±0.26 rad` 和 `0.12 m/s` 渐入，摆幅 `11.28° / 11.11°`，稳态前进 MAE `0.0530 m/s`，首次通过原 F2 与摆臂筛查。该组合使用已有的两个训练 encoder。复验运行 `2026-11-23_17-22-01` 以 `1×10⁻⁶` 学习率执行 200 次外层迭代，固定 F1 移动 encoder，只微调停步 encoder，世界模型继续用实际执行动作训练。该轮设置不会从两个旧运行恢复优化器。
+
+## 最终 checkpoint 验收通过
+
+训练代码 `7d94d4a`，训练目录 `supermimic/logs/SuperMimic-GenCoord-G1/2026-11-23_17-22-01/`。200 次外层迭代采集 25,600 条新物理转移。对比权重确认 F1 原有的 actor 张量均逐项相同，新增停步 encoder 有 18 个参数张量相对停步初始化更新。最终 actor SHA-256 为 `4c4554ff41073cc14781a148fd461f559ddd7cd4c53ab8be90edbc081ec8c47e`。
+
+| 验收项 | F1 | 最终 F2 | 门槛 |
+| --- | ---: | ---: | ---: |
+| 行走中松杆，末 0.5 s 站姿关节 RMS（rad） | 0.3595 | 0.2025（−43.7%） | 改善 ≥ 20% |
+| 行走中松杆，平均躯干倾斜（°） | 13.65 | 3.15（−76.9%） | 改善 ≥ 20% |
+| 行走中松杆，末 0.5 s 残余平移速率（m/s） | 0.0033 | 0.0090 | < 0.10 |
+| 持续直走，左 / 右肩俯仰摆幅（°） | 1.20 / 3.81 | 11.21 / 11.19 | 各 8–40，较小侧 ≥ 较大侧的一半 |
+| 持续直走，左右肩相关系数 | −0.682 | −0.887 | ≤ −0.25 |
+| 持续直走，肩差与髋差相关系数 | −0.324 | −0.533 | ≤ −0.30 |
+| 持续直走，前向 MAE（m/s） | 0.0429 | 0.0538 | ≤ 0.10 |
+
+六条原回放和新增持续直走均跑满，两个完整参考轨迹与 F1 逐字节一致。用最终 checkpoint 重做 CPU 回放，七条轨迹与摘要均逐字节相同。近静止起步平均前向 `0.315 m/s`，左右转平均偏航分别为 `+0.299` 和 `−0.354 rad/s`。移动阶段逐轴相对 F1 的最大 MAE 增量是前向 `0.0114 m/s`、侧向 `0.0169 m/s` 和偏航 `0.0284 rad/s`，均在原容差内。
+
+**原 F2 速度、姿态门槛与新增摆臂筛查同时通过。** 结果来自一个训练种子、一条留出片段及两个原初态。该片段也用于挑选肩部控制参数，因此适用范围是本轮工程验收，跨片段与跨种子的泛化仍需验证。最终 CPU 回放记录了 31 条求解器迭代上限警告。
+
+### 复现最终训练和本地验收
+
+```bash
+cd /home/hi/SuperMimic-Official/supermimic
+CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
+  src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
+  --device cuda:0 --num-envs 128 --env.seed 0 \
+  --motion-file '../data/lafan1_official/walk2_subject3.npz,../data/lafan1_official/walk3_subject3.npz' \
+  --runner.independent-velocity True --runner.posture-weight 0.25 \
+  --runner.moving-posture-scale 0 --runner.arm-swing-weight 0 \
+  --runner.arm-swing-control 0.45 --runner.turn-tracking-weight 0 \
+  --runner.init-checkpoint-dir logs/SuperMimic-GenCoord-G1/2026-11-23_16-07-37 \
+  --runner.stop-encoder-init-dir logs/SuperMimic-GenCoord-G1/2026-11-23_16-35-09 \
+  --runner.arm-swing-roll 0.26 --runner.arm-swing-speed-gate 0.12 \
+  --runner.freeze-moving-encoder True --runner.policy.lr 0.000001 \
+  --runner.actor-obs rep_state --runner.history-length 1 \
+  --runner.run-name f2-phase-anchor-finetune-s0 \
+  --runner.max-iterations 200 --runner.log-interval 50 --runner.save-interval 500 \
+  --runner.replay-ratio 4 --runner.wm.num-batches 1 --runner.wm.batch-size 128 \
+  --runner.wm.horizon 8 --runner.policy.batch-size 128 --runner.policy.horizon 32
+```
+
+```bash
+cd /home/hi/SuperMimic-Official/supermimic
+F2_CKPT=logs/SuperMimic-GenCoord-G1/2026-11-23_17-22-01
+OMP_NUM_THREADS=2 .venv/bin/python -u scripts/eval_p0.py \
+  --checkpoint-dir "$F2_CKPT" --motion-file ../data/lafan1_official/walk1_subject1.npz \
+  --record-posture True --steady-forward True --output-dir outputs/f2-final-replay
+.venv/bin/python scripts/check_f2.py outputs/f1-arm-check outputs/f2-final-replay
+
+OMP_NUM_THREADS=2 .venv/bin/python -u scripts/play_speed_test.py \
+  --checkpoint-dir "$F2_CKPT" --motion-file ../data/lafan1_official/walk1_subject1.npz \
+  --device cpu --start-paused True --num-steps-rollout 32
+```
+
+本机量化结果与对照动画见 `supermimic/outputs/f2-phase-anchor-finetune-s0/`。Viser 回放通过终端打印的本机地址打开，点击 **Play** 后在 **Velocity Command** 中设置 `Lin Vel X = 0.35 m/s` 可以观察持续摆臂。

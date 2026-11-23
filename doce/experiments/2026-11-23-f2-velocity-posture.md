@@ -43,6 +43,8 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
   --runner.wm.horizon 8 --runner.policy.batch-size 128 --runner.policy.horizon 32
 ```
 
+后续权重对照、自然摆臂诊断和最终通过的配置见 [F2 速度、停步姿态与自然摆臂](2026-11-23-f2-natural-arm-swing.md)。
+
 ## 训练后验收
 
 量化回放输出为 JSONL 和 `summary.json`。浏览器回放打开终端打印的本地地址，点击 **Play**，用速度滑块检查前进、转向和松杆。
