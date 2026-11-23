@@ -43,7 +43,7 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
   --runner.wm.horizon 8 --runner.policy.batch-size 128 --runner.policy.horizon 32
 ```
 
-后续权重对照、自然摆臂诊断和最终通过的配置见 [F2 速度、停步姿态与自然摆臂](2026-11-23-f2-natural-arm-swing.md)。
+后续权重对照与速度、停步和摆臂筛查见 [F2 速度、停步姿态与自然摆臂](2026-11-23-f2-natural-arm-swing.md)。整套步态仍未通过，见 [F2 步态与训练流程复查](2026-11-23-f2-forward-gait-audit.md)。
 
 ## 训练后验收
 
