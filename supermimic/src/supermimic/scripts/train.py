@@ -43,6 +43,7 @@ from supermimic.scripts.train_utils import (
 )
 from supermimic.tasks.forward_foot_cycle import ForwardFootCycleReward
 from supermimic.tasks.forward_gait import ForwardGaitPrior
+from supermimic.tasks.steering_recovery import physical_steering_recovery_reward
 from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPostureReward
 from supermimic.tasks.velocity_tracking import (
   configure_velocity_env,
@@ -141,6 +142,8 @@ def main() -> None:
   gait_reflection = args.runner.forward_gait_reflection
   precision_weight = args.runner.forward_precision_weight
   gait_hold_s = args.runner.forward_gait_hold_s
+  steering_recovery_limit = args.runner.steering_recovery_limit
+  steering_recovery_weight = args.runner.steering_recovery_weight
   if not math.isfinite(gait_weight) or gait_weight < 0:
     raise ValueError("Forward gait reward weight must be finite and nonnegative.")
   if not 0 <= gait_limit <= 0.7 or not 0 <= gait_fraction <= 1:
@@ -161,6 +164,12 @@ def main() -> None:
     raise ValueError("Foot cycle weight must be finite, nonnegative and used with phase-conditioned walking.")
   if gait_limit and args.runner.actor_obs != "rep_state":
     raise ValueError("The experimental gait adapter requires rep_state observations.")
+  if not 0 <= steering_recovery_limit <= 0.55 or not math.isfinite(steering_recovery_weight) or steering_recovery_weight < 0:
+    raise ValueError("Invalid steering recovery action limit or reward weight.")
+  if (steering_recovery_limit or steering_recovery_weight) and not args.runner.independent_velocity:
+    raise ValueError("Steering recovery requires the independent velocity task.")
+  if steering_recovery_limit and (teacher_steps or args.runner.actor_obs != "rep_state"):
+    raise ValueError("Steering-only fine tuning requires rep_state and skips the gait teacher.")
   if not math.isfinite(posture_weight) or posture_weight < 0:
     raise ValueError("Posture reward weight must be finite and nonnegative.")
   if not 0.0 <= moving_posture_scale <= 1.0:
@@ -260,6 +269,10 @@ def main() -> None:
     if turn_tracking_weight:
       args.env.rewards["turn_tracking"] = RewardTermCfg(
         func=physical_turn_tracking_reward, weight=turn_tracking_weight,
+      )
+    if steering_recovery_weight:
+      args.env.rewards["steering_recovery"] = RewardTermCfg(
+        func=physical_steering_recovery_reward, weight=steering_recovery_weight
       )
 
   # 按最终配置、并行环境数和设备创建并包装物理仿真环境。

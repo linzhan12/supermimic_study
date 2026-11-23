@@ -91,6 +91,7 @@ from supermimic.tasks.forward_gait import (
   G1SagittalReflection,
   warm_start_gait_adapter,
 )
+from supermimic.tasks.steering_recovery import SteeringRecoveryAdapter
 # 来自 supermimic/src/supermimic/replay_buffer.py：FieldSpec 描述单字段宽度与类型，
 # ReplayBuffer 为每个物理环境维护独立时间环，提供不跨回合的连续窗口和历史起点采样。
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -240,6 +241,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Additional tight velocity tracking for straight walking."""
   forward_gait_hold_s: tuple[float, float] | None = None
   """Override the hold interval for added forward-walking commands."""
+  steering_recovery_limit: float = 0.0
+  """Train a bounded non-straight action correction in radians."""
+  steering_recovery_weight: float = 0.0
+  """Weight of narrow heading-velocity tracking for turning and lateral motion."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -436,6 +441,11 @@ def build_actor(
         representation.fk.joint_names, wm.action_names, wm.dynamics.action_scale,
         wm.dynamics.action_offset, cfg.forward_gait_reflection,
       )
+  steering_adapter = None
+  if cfg.steering_recovery_limit:
+    steering_adapter = SteeringRecoveryAdapter(
+      obs_dim, wm.action_names, wm.dynamics.action_scale, cfg.steering_recovery_limit
+    )
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
@@ -448,6 +458,7 @@ def build_actor(
     arm_swing_control=arm_control,
     separate_stop_encoder=cfg.stop_encoder_init_dir is not None,
     forward_gait_adapter=gait_adapter,
+    steering_recovery_adapter=steering_adapter,
   ).to(device)
 
 
@@ -1056,18 +1067,17 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           f"stop_encoder.{name.removeprefix(prefix)}": value
           for name, value in source.items() if name.startswith(prefix)
         })
-      if actor.forward_gait_adapter is not None and not any(
-        name.startswith("forward_gait_adapter.") for name in state
-      ):
-        state.update({
-          name: value for name, value in actor.state_dict().items()
-          if name.startswith("forward_gait_adapter.")
-        })
+      for adapter_name in ("forward_gait_adapter", "steering_recovery_adapter"):
+        prefix = f"{adapter_name}."
+        if getattr(actor, adapter_name) is not None and not any(name.startswith(prefix) for name in state):
+          state.update({name: value for name, value in actor.state_dict().items() if name.startswith(prefix)})
       actor.load_state_dict(state)
     self._velocity_command = None
     if self.cfg.independent_velocity:
       actor.requires_grad_(False)
-      if actor.forward_gait_adapter is not None:
+      if actor.steering_recovery_adapter is not None:
+        actor.steering_recovery_adapter.requires_grad_(True)
+      elif actor.forward_gait_adapter is not None:
         actor.forward_gait_adapter.requires_grad_(True)
       else:
         if actor.stop_encoder is not None:

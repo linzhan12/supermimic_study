@@ -7,6 +7,7 @@ from tensordict import TensorDict
 from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.tasks.forward_foot_cycle import ForwardFootCycleReward
 from supermimic.tasks.forward_gait import ForwardGaitPrior
+from supermimic.tasks.steering_recovery import steering_recovery_reward
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.tasks.velocity_posture import (
   VelocityArmSwingReward,
@@ -39,6 +40,11 @@ class VelocityWorldModelEnv(WorldModelEnv):
     self.forward_precision_weight = (
       env.cfg.rewards["forward_precision"].weight
       if "forward_precision" in env.cfg.rewards
+      else 0.0
+    )
+    self.steering_recovery_weight = (
+      env.cfg.rewards["steering_recovery"].weight
+      if "steering_recovery" in env.cfg.rewards
       else 0.0
     )
     self.posture = None
@@ -88,6 +94,10 @@ class VelocityWorldModelEnv(WorldModelEnv):
     if self.turn_tracking_weight:
       reward = reward + self.turn_tracking_weight * turn_tracking_reward(
         angular_w[..., 2], self.command
+      )
+    if self.steering_recovery_weight:
+      reward = reward + self.steering_recovery_weight * steering_recovery_reward(
+        quat, linear_w, angular_w, self.command
       )
     height = next_aux_state[..., 2]
     if self.posture is not None:

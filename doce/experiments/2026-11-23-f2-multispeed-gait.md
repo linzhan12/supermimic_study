@@ -135,3 +135,5 @@ OMP_NUM_THREADS=2 .venv/bin/python -u scripts/eval_p0.py \
 第 2,000 次迭代也通过三档步态与连贯换速筛查，转向三项超限。`outputs/f2-reflection-i1000-snapshot/` 和 `outputs/f2-reflection-i2000-snapshot/` 保存了本地中间权重，包含 actor、世界模型和回放配置。`outputs/f2-reflection-i1000-s0/forward-gait-comparison.gif` 用同一视角比较完整参考、旧 F2 和本轮中间权重。
 
 最终 `4,800` 次版本三档前向为 `0.225 / 0.365 / 0.512 m/s`，中速落脚间距约 `22.6 / 22.6 cm`，但左转前向、左转偏航和右斜移偏航的误差较 F1 分别上升 `0.1552 m/s`、`0.1975 rad/s` 和 `0.1028 rad/s`。第 1,000 次版本另在留出的 `walk2_subject4`（初态 `70 / 5599`）与 `walk4_subject1`（初态 `60 / 3559`）各通过了三档步态和连续换速筛查。两个额外用例均有走转误差超限。现象支持冻结直走并补训转向及斜移，完整 F2 尚未通过。
+
+后续独立补训了转向和侧移，第 1,600 次保存点通过四组完整验收。 [最终验收和复现命令](2026-11-23-f2-multispeed-acceptance.md)

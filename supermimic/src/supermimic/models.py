@@ -214,6 +214,7 @@ class MultiEncoderAE(nn.Module):
     arm_swing_control: nn.Module | None = None,
     separate_stop_encoder: bool = False,
     forward_gait_adapter: nn.Module | None = None,
+    steering_recovery_adapter: nn.Module | None = None,
   ):
     """为任务建立目标编码器、归一化器和共享动作解码器。
 
@@ -238,6 +239,7 @@ class MultiEncoderAE(nn.Module):
     self.task_specs = task_specs
     self.arm_swing_control = arm_swing_control
     self.forward_gait_adapter = forward_gait_adapter
+    self.steering_recovery_adapter = steering_recovery_adapter
     self._task_names = [ts.name for ts in task_specs]
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
     # encoder against the anchor encoder on the same state.
@@ -340,7 +342,9 @@ class MultiEncoderAE(nn.Module):
     # 归一化沿最后特征轴应用，保留 [B,H,D]；flatten(start_dim=1) 再将历史展开。
     history_n = self.obs_normalizer(obs_td["history"])
     actions = self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
-    if self.arm_swing_control is not None or self.forward_gait_adapter is not None:
+    if any(module is not None for module in (
+      self.arm_swing_control, self.forward_gait_adapter, self.steering_recovery_adapter,
+    )):
       lo, hi = slots[self._task_names.index("velocity")]
       if lo < hi:
         adjusted = actions[lo:hi]
@@ -361,6 +365,8 @@ class MultiEncoderAE(nn.Module):
             reflected_action, reflected_history, reflected_norm, reflected_command, phase + 0.5
           )
           adjusted = adjusted.lerp(reflection.action(reflected_action), reflection.weight(command))
+        if self.steering_recovery_adapter is not None:
+          adjusted = self.steering_recovery_adapter(adjusted, history_n[lo:hi, -1], command)
         actions = torch.cat((actions[:lo], adjusted, actions[hi:]), dim=0)
     return actions
 
