@@ -91,7 +91,7 @@ from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 # 来自 supermimic/src/supermimic/representations.py：StateRepresentation 约定状态语义与积分接口；
 # create_representation 按 gencoord/maxcoord 选择具体实现，让 runner 不必硬编码两种坐标算法。
-from supermimic.representations import StateRepresentation, create_representation
+from supermimic.representations import GenCoordRepresentation, StateRepresentation, create_representation
 # 来自 supermimic/src/supermimic/runners/exporter.py：把满足条件的传感器策略导出为 ONNX。
 # 返回的文件路径加入同一次模型上传；不是每次策略更新都执行导出。
 from supermimic.runners.exporter import export_actor_as_onnx
@@ -110,6 +110,7 @@ from supermimic.tasks.task_spec import (
   resolve_task_specs,
 )
 from supermimic.tasks.velocity_tracking import IndependentVelocityCommand
+from supermimic.tasks.velocity_posture import G1ArmSwingControl
 # 来自 supermimic/src/supermimic/utils/helpers.py：extract_action_scale_offset 读取动作缩放与偏置，
 # 使 Dynamics 与物理环境采用相同命令尺度；unpack_obs_dims 读取 full_state 和 goal 的特征宽度。
 from supermimic.utils.helpers import (
@@ -204,6 +205,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Posture weight multiplier during nonzero velocity commands."""
   arm_swing_weight: float = 0.0
   """Weight for contralateral arm swing during forward walking."""
+  arm_swing_control: float = 0.0
+  """Blend weight of phase-driven G1 shoulder targets in the velocity branch."""
+  turn_tracking_weight: float = 0.0
+  """Additional narrow yaw tracking reward on turning commands."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -241,6 +246,7 @@ class WorldModel:
   sim_context: SimContext
   num_goals: int
   num_actions: int
+  action_names: tuple[str, ...] = ()
 
   # 函数作用：返回用于保存世界模型的状态字典组合。
   def bundle(self) -> dict:
@@ -347,6 +353,9 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     sim_context=sim_context,
     num_goals=num_goals,
     num_actions=num_actions,
+    action_names=tuple(env.unwrapped.action_manager.get_term(
+      env.unwrapped.action_manager.active_terms[0]
+    ).target_names),
   )
 
 
@@ -374,6 +383,13 @@ def build_actor(
     if cfg.actor_obs == "rep_state"
     else representation.proprio_obs_dim(wm.num_actions)
   )
+  arm_control = None
+  if cfg.arm_swing_control:
+    if not isinstance(representation, GenCoordRepresentation) or cfg.actor_obs != "rep_state":
+      raise ValueError("Arm swing control requires G1 GenCoord rep_state observations.")
+    arm_control = G1ArmSwingControl(
+      representation.fk.joint_names, wm.action_names, wm.dynamics.action_scale, cfg.arm_swing_control
+    )
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
@@ -383,6 +399,7 @@ def build_actor(
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
+    arm_swing_control=arm_control,
   ).to(device)
 
 

@@ -209,6 +209,7 @@ class MultiEncoderAE(nn.Module):
     hidden_dims: tuple[int, ...],
     latent_bc_weight: float,
     history_length: int,
+    arm_swing_control: nn.Module | None = None,
   ):
     """为任务建立目标编码器、归一化器和共享动作解码器。
 
@@ -231,6 +232,7 @@ class MultiEncoderAE(nn.Module):
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
     self.task_specs = task_specs
+    self.arm_swing_control = arm_swing_control
     self._task_names = [ts.name for ts in task_specs]
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
     # encoder against the anchor encoder on the same state.
@@ -331,7 +333,15 @@ class MultiEncoderAE(nn.Module):
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
     # 归一化沿最后特征轴应用，保留 [B,H,D]；flatten(start_dim=1) 再将历史展开。
     history_n = self.obs_normalizer(obs_td["history"])
-    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
+    actions = self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
+    if self.arm_swing_control is not None:
+      lo, hi = slots[self._task_names.index("velocity")]
+      if lo < hi:
+        adjusted = self.arm_swing_control(
+          actions[lo:hi], obs_td["history"][lo:hi, -1], obs_td["goal_velocity"][lo:hi]
+        )
+        actions = torch.cat((actions[:lo], adjusted, actions[hi:]), dim=0)
+    return actions
 
   # 函数作用：计算非锚点任务的潜变量模仿损失，返回逐样本 [B]。
   def _compute_aux_loss(

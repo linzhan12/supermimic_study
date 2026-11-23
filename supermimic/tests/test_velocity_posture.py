@@ -1,6 +1,30 @@
 import torch
 
-from supermimic.tasks.velocity_posture import arm_swing_score, lower_body_score
+from supermimic.tasks.velocity_posture import (
+  G1ArmSwingControl,
+  arm_swing_score,
+  lower_body_score,
+)
+
+
+def test_arm_control_uses_hip_phase_and_only_changes_shoulder_pitch_columns():
+  hips = ["left_hip_pitch_joint", "right_hip_pitch_joint"]
+  action_names = (
+    "right_shoulder_pitch_joint",
+    "left_hip_pitch_joint",
+    "left_shoulder_pitch_joint",
+  )
+  control = G1ArmSwingControl(hips, action_names, torch.ones(3), gain=1.0)
+  state = torch.zeros((2, 14))
+  state[:, 10:12] = torch.tensor([[0.20, -0.20], [-0.20, 0.20]])
+  action = torch.full((2, 3), 0.5)
+  adjusted = control(action, state, torch.tensor([[0.35, 0.0, 0.0], [0.35, 0.0, 0.0]]))
+  torch.testing.assert_close(adjusted[:, 1], action[:, 1])
+  assert adjusted[0, 0] > 0 > adjusted[0, 2]
+  torch.testing.assert_close(
+    adjusted[1, :], torch.tensor([-adjusted[0, 0], 0.5, -adjusted[0, 2]])
+  )
+  torch.testing.assert_close(control(action, state, torch.zeros((2, 3))), action)
 
 
 def test_forward_arm_reward_favors_moderate_opposite_swing():

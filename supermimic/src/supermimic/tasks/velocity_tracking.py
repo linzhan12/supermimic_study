@@ -184,6 +184,17 @@ def physical_velocity_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
   return velocity_reward(quat_w, linear_w, quat_apply(quat_w, angular_b), command)
 
 
+def turn_tracking_reward(yaw_rate: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+  active = (command[..., 2].abs() / 0.30).clamp(0, 1)
+  return active * torch.exp(-((yaw_rate - command[..., 2]) / 0.22).square())
+
+
+def physical_turn_tracking_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
+  _, quat, _, angular_b = physical_root(env)
+  command = env.command_manager.get_command("velocity")
+  return turn_tracking_reward(quat_apply(quat, angular_b)[..., 2], command)
+
+
 def physical_fall(env: ManagerBasedRlEnv) -> torch.Tensor:
   height, quat_w, _, _ = physical_root(env)
   return fall_severity(height, quat_w) > 1.0

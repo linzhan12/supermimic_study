@@ -13,6 +13,7 @@ from supermimic.tasks.velocity_posture import (
 from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
   fall_severity,
+  turn_tracking_reward,
   velocity_reward,
 )
 from supermimic.utils.gencoord_helpers import decompose_rep_state
@@ -24,6 +25,11 @@ class VelocityWorldModelEnv(WorldModelEnv):
     assert isinstance(term, IndependentVelocityCommand)
     self.schedule = term.schedule
     self.dt = env.unwrapped.step_dt
+    self.turn_tracking_weight = (
+      env.cfg.rewards["turn_tracking"].weight
+      if "turn_tracking" in env.cfg.rewards
+      else 0.0
+    )
     self.posture = None
     if "posture" in env.cfg.rewards:
       posture = env.unwrapped.reward_manager.get_term_cfg("posture")
@@ -51,6 +57,10 @@ class VelocityWorldModelEnv(WorldModelEnv):
     quat = next_aux_state[..., 3:7]
     linear_w, angular_w = quat_apply(quat, linear_b), quat_apply(quat, angular_b)
     reward = velocity_reward(quat, linear_w, angular_w, self.command)
+    if self.turn_tracking_weight:
+      reward = reward + self.turn_tracking_weight * turn_tracking_reward(
+        angular_w[..., 2], self.command
+      )
     height = next_aux_state[..., 2]
     if self.posture is not None:
       reward = reward + self.posture_weight * self.posture.score(

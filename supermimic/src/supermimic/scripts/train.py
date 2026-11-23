@@ -42,7 +42,7 @@ from supermimic.scripts.train_utils import (
   setup_device,
 )
 from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPostureReward
-from supermimic.tasks.velocity_tracking import configure_velocity_env
+from supermimic.tasks.velocity_tracking import configure_velocity_env, physical_turn_tracking_reward
 
 
 # @dataclass 为配置类自动生成初始化方法；类可以理解为配置对象的模板。
@@ -124,14 +124,20 @@ def main() -> None:
   posture_weight = args.runner.posture_weight
   moving_posture_scale = args.runner.moving_posture_scale
   arm_swing_weight = args.runner.arm_swing_weight
+  arm_swing_control = args.runner.arm_swing_control
+  turn_tracking_weight = args.runner.turn_tracking_weight
   if not math.isfinite(posture_weight) or posture_weight < 0:
     raise ValueError("Posture reward weight must be finite and nonnegative.")
   if not 0.0 <= moving_posture_scale <= 1.0:
     raise ValueError("Moving posture scale must be between 0 and 1.")
   if not math.isfinite(arm_swing_weight) or arm_swing_weight < 0:
     raise ValueError("Arm swing reward weight must be finite and nonnegative.")
-  if (posture_weight or arm_swing_weight) and not args.runner.independent_velocity:
-    raise ValueError("Posture and arm swing rewards require the independent velocity task.")
+  if not 0 <= arm_swing_control <= 1:
+    raise ValueError("Arm swing control must be between 0 and 1.")
+  if not math.isfinite(turn_tracking_weight) or turn_tracking_weight < 0:
+    raise ValueError("Turn tracking weight must be finite and nonnegative.")
+  if (posture_weight or arm_swing_weight or arm_swing_control or turn_tracking_weight) and not args.runner.independent_velocity:
+    raise ValueError("F2 posture, arm swing and turn settings require the independent velocity task.")
   if args.runner.independent_velocity:
     if chosen_task != "SuperMimic-GenCoord-G1" or args.runner.representation != "gencoord":
       raise ValueError("Independent velocity fine-tuning requires SuperMimic-GenCoord-G1.")
@@ -191,6 +197,10 @@ def main() -> None:
     if arm_swing_weight:
       args.env.rewards["arm_swing"] = RewardTermCfg(
         func=VelocityArmSwingReward, weight=arm_swing_weight,
+      )
+    if turn_tracking_weight:
+      args.env.rewards["turn_tracking"] = RewardTermCfg(
+        func=physical_turn_tracking_reward, weight=turn_tracking_weight,
       )
 
   # 按最终配置、并行环境数和设备创建并包装物理仿真环境。

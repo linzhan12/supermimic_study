@@ -8,8 +8,10 @@ import torch
 from mjlab.managers import RewardTermCfg
 from mjlab.utils.forward_kinematics import ForwardKinematics
 from mjlab.utils.lab_api.math import quat_apply
+from torch import nn
 
 from supermimic.tasks.velocity_tracking import physical_root
+from supermimic.utils.gencoord_helpers import decompose_rep_state
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -46,11 +48,48 @@ def arm_swing_score(
   swing = 0.24 * torch.tanh(hip_difference / 0.22)
   target = torch.stack((-swing, swing), dim=-1)
   error = ((shoulder_offset - target) / 0.13).square().mean(dim=-1)
+  return forward_swing_gate(command) / (1 + error)
+
+
+def forward_swing_gate(command: torch.Tensor) -> torch.Tensor:
   forward = ((command[..., 0] - 0.1) / 0.15).clamp(0, 1)
   straight = torch.exp(
     -(command[..., 1] / 0.12).square() - (command[..., 2] / 0.16).square()
   )
-  return forward * straight / (1 + error)
+  return forward * straight
+
+
+class G1ArmSwingControl(nn.Module):
+  """Blend G1 shoulder targets toward the opposing hip phase on straight walks."""
+
+  def __init__(
+    self,
+    joint_names: list[str],
+    action_names: tuple[str, ...],
+    scale: torch.Tensor,
+    gain: float,
+  ) -> None:
+    super().__init__()
+    self.hips = tuple(
+      joint_names.index(f"{side}_hip_pitch_joint") for side in ("left", "right")
+    )
+    shoulders = [
+      action_names.index(f"{side}_shoulder_pitch_joint") for side in ("left", "right")
+    ]
+    columns = torch.tensor(shoulders, device=scale.device)
+    self.register_buffer("shoulders", columns, persistent=False)
+    self.register_buffer("scale", scale.reshape(-1)[columns].clone(), persistent=False)
+    self.gain = gain
+
+  def forward(self, action: torch.Tensor, state: torch.Tensor, command: torch.Tensor):
+    _, _, _, _, q, qd = decompose_rep_state(state)
+    left, right = self.hips
+    phase = q[..., left] - q[..., right] + 0.06 * (qd[..., left] - qd[..., right])
+    swing = 0.33 * torch.tanh(phase / 0.20)
+    target = torch.stack((-swing, swing), dim=-1) / self.scale
+    blend = self.gain * forward_swing_gate(command)[..., None]
+    shoulders = action.index_select(-1, self.shoulders).lerp(target, blend)
+    return action.index_copy(-1, self.shoulders, shoulders)
 
 
 class VelocityArmSwingReward:
