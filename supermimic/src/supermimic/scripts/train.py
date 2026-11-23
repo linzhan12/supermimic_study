@@ -41,6 +41,7 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.forward_gait import ForwardGaitPrior
 from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPostureReward
 from supermimic.tasks.velocity_tracking import configure_velocity_env, physical_turn_tracking_reward
 
@@ -126,6 +127,15 @@ def main() -> None:
   arm_swing_weight = args.runner.arm_swing_weight
   arm_swing_control = args.runner.arm_swing_control
   turn_tracking_weight = args.runner.turn_tracking_weight
+  gait_weight = args.runner.forward_gait_weight
+  gait_limit = args.runner.forward_gait_action_limit
+  gait_fraction = args.runner.forward_gait_command_fraction
+  if not math.isfinite(gait_weight) or gait_weight < 0:
+    raise ValueError("Forward gait reward weight must be finite and nonnegative.")
+  if not 0 <= gait_limit <= 0.7 or not 0 <= gait_fraction <= 1:
+    raise ValueError("Forward gait action limit must be in [0, 0.7] and fraction in [0, 1].")
+  if (gait_limit or gait_fraction or gait_weight) and not args.runner.independent_velocity:
+    raise ValueError("Forward gait shaping requires the independent velocity task.")
   if not math.isfinite(posture_weight) or posture_weight < 0:
     raise ValueError("Posture reward weight must be finite and nonnegative.")
   if not 0.0 <= moving_posture_scale <= 1.0:
@@ -200,7 +210,9 @@ def main() -> None:
     args.runner.slot_mix = {"motion": 0.0, "velocity": 1.0}
     args.runner.latent_bc_weight = 0.0
     args.runner.sampling_mode = "uniform"
-    configure_velocity_env(args.env)
+    configure_velocity_env(args.env, gait_fraction=gait_fraction)
+    if gait_weight:
+      args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)
     if posture_weight:
       args.env.rewards["posture"] = RewardTermCfg(
         func=VelocityPostureReward, weight=posture_weight,

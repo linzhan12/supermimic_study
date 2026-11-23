@@ -86,6 +86,7 @@ from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerC
 # MultiEncoderAE 为各任务编码目标，再用共享解码器输出动作；build_mlp 构造普通张量 MLP。
 # 这里的 build_mlp 用于当前 runner 的 critic，与基类返回 MLPModel 的 _build_mlp 不同。
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
+from supermimic.tasks.forward_gait import ForwardGaitAdapter
 # 来自 supermimic/src/supermimic/replay_buffer.py：FieldSpec 描述单字段宽度与类型，
 # ReplayBuffer 为每个物理环境维护独立时间环，提供不跨回合的连续窗口和历史起点采样。
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -217,6 +218,12 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Freeze the original velocity encoder when a separate stop encoder is present."""
   turn_tracking_weight: float = 0.0
   """Additional narrow yaw tracking reward on turning commands."""
+  forward_gait_weight: float = 0.0
+  """Weight of the speed-conditioned demonstration reward for straight walking."""
+  forward_gait_action_limit: float = 0.0
+  """Train a straight-walking adapter with at most this many radians of action correction."""
+  forward_gait_command_fraction: float = 0.0
+  """Probability of replacing an ordinary sampled command with forward walking."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -400,6 +407,11 @@ def build_actor(
       offset=wm.dynamics.action_offset, roll=cfg.arm_swing_roll,
       speed_gate=cfg.arm_swing_speed_gate,
     )
+  gait_adapter = None
+  if cfg.forward_gait_action_limit:
+    gait_adapter = ForwardGaitAdapter(
+      obs_dim, wm.action_names, wm.dynamics.action_scale, cfg.forward_gait_action_limit
+    )
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
@@ -411,6 +423,7 @@ def build_actor(
     history_length=cfg.history_length,
     arm_swing_control=arm_control,
     separate_stop_encoder=cfg.stop_encoder_init_dir is not None,
+    forward_gait_adapter=gait_adapter,
   ).to(device)
 
 
@@ -1017,14 +1030,24 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           f"stop_encoder.{name.removeprefix(prefix)}": value
           for name, value in source.items() if name.startswith(prefix)
         })
+      if actor.forward_gait_adapter is not None and not any(
+        name.startswith("forward_gait_adapter.") for name in state
+      ):
+        state.update({
+          name: value for name, value in actor.state_dict().items()
+          if name.startswith("forward_gait_adapter.")
+        })
       actor.load_state_dict(state)
     self._velocity_command = None
     if self.cfg.independent_velocity:
       actor.requires_grad_(False)
-      if actor.stop_encoder is not None:
-        actor.stop_encoder.requires_grad_(True)
-      if actor.stop_encoder is None or not self.cfg.freeze_moving_encoder:
-        actor.encoders["velocity"].requires_grad_(True)
+      if actor.forward_gait_adapter is not None:
+        actor.forward_gait_adapter.requires_grad_(True)
+      else:
+        if actor.stop_encoder is not None:
+          actor.stop_encoder.requires_grad_(True)
+        if actor.stop_encoder is None or not self.cfg.freeze_moving_encoder:
+          actor.encoders["velocity"].requires_grad_(True)
       term = self.env.unwrapped.command_manager.get_term("velocity")
       assert isinstance(term, IndependentVelocityCommand)
       self._velocity_command = term

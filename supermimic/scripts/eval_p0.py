@@ -65,6 +65,7 @@ class Config:
   task_id: str = "SuperMimic-GenCoord-G1"
   record_posture: bool = False
   steady_forward: bool = False
+  extra_forward_speeds: tuple[float, ...] = ()
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -161,8 +162,10 @@ def summarize(trace: list[dict], planned_steps: int, dt: float) -> dict:
 def evaluate(cfg: Config) -> None:
   if cfg.seed < 0:
     raise ValueError("Use a nonnegative seed for paired replay.")
-  if cfg.steady_forward and not cfg.record_posture:
+  if (cfg.steady_forward or cfg.extra_forward_speeds) and not cfg.record_posture:
     raise ValueError("The steady forward test requires --record-posture True.")
+  if any(not math.isfinite(speed) or speed <= 0 for speed in cfg.extra_forward_speeds):
+    raise ValueError("Extra forward speeds must be finite positive m/s values.")
   if cfg.motion_file.suffix != ".npz" or not cfg.motion_file.is_file():
     raise ValueError("Pass one local G1 reference .npz file.")
   configure_torch_backends(allow_tf32=False, deterministic=True)
@@ -245,7 +248,13 @@ def evaluate(cfg: Config) -> None:
     ]
     if cfg.steady_forward:
       case_definitions.append(("steady_forward", cfg.stand_frame, STEADY_FORWARD))
+    for speed in cfg.extra_forward_speeds:
+      label = f"steady_forward_{speed:.3f}".replace(".", "p")
+      phases = (STEADY_FORWARD[0], ("forward", STEADY_FORWARD[1][1], (speed, 0.0, 0.0)))
+      case_definitions.append((label, cfg.stand_frame, phases))
     for case, frame, phases in case_definitions:
+      if case in scenarios:
+        raise ValueError(f"Duplicate scenario: {case}")
       schedule = []
       for phase, duration, command in phases:
         target = ref_raw.new_tensor(command)
@@ -285,7 +294,7 @@ def evaluate(cfg: Config) -> None:
     for case, (frame, schedule) in scenarios.items():
       initial = None
       case_summary = {"reference_frame": frame, "routes": {}}
-      routes = ("scripted_velocity",) if case == "steady_forward" else ROUTES
+      routes = ("scripted_velocity",) if case.startswith("steady_forward") else ROUTES
       for route in routes:
         task = "motion" if route == "motion" else "velocity"
         actor.set_slot_mix({task: 1.0})
@@ -382,7 +391,7 @@ def evaluate(cfg: Config) -> None:
           for row in trace:
             stream.write(json.dumps(row, allow_nan=False) + "\n")
         result = summarize(trace, len(schedule), dt)
-        if case == "steady_forward" and result["completed"]:
+        if case.startswith("steady_forward") and result["completed"]:
           result["arm_swing"] = arm_swing_metrics(
             trace[-round(4.0 / dt) :], robot.joint_names
           )

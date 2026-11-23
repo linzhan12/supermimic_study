@@ -5,6 +5,7 @@ from mjlab.utils.lab_api.math import quat_apply
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.tasks.forward_gait import ForwardGaitPrior
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.tasks.velocity_posture import (
   VelocityArmSwingReward,
@@ -43,6 +44,12 @@ class VelocityWorldModelEnv(WorldModelEnv):
       assert isinstance(swing.func, VelocityArmSwingReward)
       self.arm_swing = swing.func
       self.arm_swing_weight = swing.weight
+    self.forward_gait = None
+    if "forward_gait" in env.cfg.rewards:
+      gait = env.unwrapped.reward_manager.get_term_cfg("forward_gait")
+      assert isinstance(gait.func, ForwardGaitPrior)
+      self.forward_gait = gait.func
+      self.forward_gait_weight = gait.weight
 
   def _on_reset(self, batch: TensorDict) -> None:
     self.command = batch["velocity_command"]
@@ -75,6 +82,10 @@ class VelocityWorldModelEnv(WorldModelEnv):
       )
     if self.arm_swing is not None:
       reward = reward + self.arm_swing_weight * self.arm_swing.score(q, self.command)
+    if self.forward_gait is not None:
+      reward = reward + self.forward_gait_weight * self.forward_gait.score(
+        height, q, qd, self.command
+      )
     severity = fall_severity(height, quat)
     done = torch.sigmoid((severity - 1.0) / self._termination_softness)
     return done, reward * self.dt
