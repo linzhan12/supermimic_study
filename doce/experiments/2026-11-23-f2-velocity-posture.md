@@ -131,3 +131,47 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
 ```
 
 复用同一闭环评测和原门槛，重点比较四个超差项与两个停步姿态项。若加预算后仍有同类超差，再回到 2,000 次预算单独比较较低姿态权重。若更长预算的 F2 达标，正式比较再配对运行相同预算的 F1。阶段出口仍要求姿态和速度联合达标。
+
+### 6,000 次复验结果
+
+运行 `2026-11-23_16-49-21` 于 16:52:07 正常结束。从本地配置逐项核对，和上一轮相比只有迭代数及运行名不同。复用 `walk1_subject1.npz`、种子 0、两个初态和相同命令。六条回放均跑满，完整参考的两条轨迹与 F1 逐字节一致，绝对起步、转向及松杆速度门槛也通过。
+
+| 行走中松杆后的指标 | F1 | F2 2,000 次 | F2 6,000 次 |
+| --- | ---: | ---: | ---: |
+| 末 0.5 s 名义站姿关节 RMS（rad） | 0.359 | 0.200 | 0.270 |
+| 松杆段平均躯干倾斜（°） | 13.65 | 3.32 | 2.77 |
+| 末 0.5 s 平均残余平移速率（m/s） | 0.0033 | 0.0037 | 0.0052 |
+
+F2 6,000 次的站姿关节 RMS 和躯干倾斜分别比 F1 低 `24.8%` 和 `79.7%`，达到两项姿态门槛。原来的左转前向 MAE 从 `0.0958` 降至 `0.0398 m/s`，右转前向 MAE 从 `0.0863` 降至 `0.0667 m/s`，均回到容差内。近静止起步的前向误差和行走初态直走的偏航误差仍超差，另有四个新超差项。
+
+| 6,000 次后超差的阶段 | 指标 | F1 MAE | F2 2,000 次 MAE | F2 6,000 次 MAE | 6,000 次相对 F1 增量 | 容许增量 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 近静止用例起步 | 前向（m/s） | 0.0490 | 0.0824 | 0.0955 | +0.0465 | 0.0300 |
+| 近静止用例右转 | 偏航（rad/s） | 0.0947 | 0.1173 | 0.1909 | +0.0962 | 0.0500 |
+| 近静止用例左斜移 | 前向（m/s） | 0.0325 | 0.0468 | 0.0675 | +0.0351 | 0.0300 |
+| 近静止用例左斜移 | 偏航（rad/s） | 0.1599 | 0.1525 | 0.2108 | +0.0509 | 0.0500 |
+| 行走初态直走 | 侧向（m/s） | 0.0592 | 0.0685 | 0.0916 | +0.0325 | 0.0300 |
+| 行走初态直走 | 偏航（rad/s） | 0.1843 | 0.2492 | 0.2650 | +0.0807 | 0.0500 |
+
+在这次 6,000 次运行中，`Policy/reward` 在 1,750–1,950、3,750–3,950 和 5,750–5,950 次的平均值分别为 `3.4092`、`3.3900` 和 `3.3703`。加预算修复了部分命令，整体速度超差项却从四项增加到六项。**固定权重 `0.25` 的复验仍未通过，阶段留在 F2。** 这组结果表明把本次预算增至 6,000 次仍不足以跨过联合门槛。单个种子和片段也限制了对训练收敛和奖励权重的因果判断。
+
+原始轨迹、评分、训练曲线和比较记录位于本机 `supermimic/outputs/f2-posture-6000-s0-20261123/`。CPU 回放记录了 39 条求解器迭代上限警告。评测权重 SHA-256 为 `e41a184db9ca3c10a6a657491778dd628a92ed21d60f85fbe3eb5a67211fdf05`。
+
+### 固定预算的姿态权重复验
+
+恢复到首轮的 2,000 次预算。从相同预训练起点重新训练，将姿态权重由 `0.25` 降至 `0.125`，以相同种子、命令分布和数据比较。继续按原门槛验收，检查速度是否恢复、两项停步姿态改善是否仍各达 20%。
+
+```bash
+cd /home/hi/SuperMimic-Official/supermimic
+CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
+  src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
+  --device cuda:0 --num-envs 128 --env.seed 0 \
+  --motion-file '../data/lafan1_official/walk2_subject3.npz,../data/lafan1_official/walk3_subject3.npz' \
+  --runner.independent-velocity True --runner.posture-weight 0.125 \
+  --runner.init-checkpoint-dir logs/SuperMimic-GenCoord-G1/2026-11-17_17-55-41 \
+  --runner.actor-obs rep_state --runner.history-length 1 \
+  --runner.run-name f2-velocity-posture-weight-0125-s0 \
+  --runner.max-iterations 2000 --runner.log-interval 50 --runner.save-interval 500 \
+  --runner.replay-ratio 4 --runner.wm.num-batches 1 --runner.wm.batch-size 128 \
+  --runner.wm.horizon 8 --runner.policy.batch-size 128 --runner.policy.horizon 32
+```
