@@ -17,7 +17,6 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionLoader
-from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
@@ -29,6 +28,7 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.tasks.task_spec import VelocityTaskCfg, build_actor_obs_td
+from supermimic.tasks.velocity_tracking import heading_velocity
 
 STAND_START = (
   ("stand", 1.0, (0.0, 0.0, 0.0)),
@@ -59,14 +59,6 @@ class Config:
   seed: int = 0
   device: str = "cpu"
   task_id: str = "SuperMimic-GenCoord-G1"
-
-
-def heading_velocity(
-  quat_w: torch.Tensor, linear_w: torch.Tensor, angular_w: torch.Tensor
-) -> torch.Tensor:
-  """Return forward and left speed in m/s and world-up yaw rate in rad/s."""
-  planar = quat_apply_inverse(yaw_quat(quat_w), linear_w)[..., :2]
-  return torch.cat((planar, angular_w[..., 2:3]), dim=-1)
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:

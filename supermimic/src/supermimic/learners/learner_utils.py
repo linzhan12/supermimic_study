@@ -25,9 +25,12 @@ def build_optimizers(
     for seq in module.modules()
     if isinstance(seq, nn.Sequential)
     for linear in [m for m in seq if isinstance(m, nn.Linear)][1:-1]
+    if linear.weight.requires_grad
   ]
   hidden_ids = {id(p) for p in hidden}
-  rest = [p for m in modules for p in m.parameters() if id(p) not in hidden_ids]
+  rest = [
+    p for m in modules for p in m.parameters() if p.requires_grad and id(p) not in hidden_ids
+  ]
   adam = torch.optim.Adam(
     rest, lr=torch.tensor(lr, device=device), betas=betas, fused=True, capturable=True
   )

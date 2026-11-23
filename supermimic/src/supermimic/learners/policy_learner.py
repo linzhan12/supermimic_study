@@ -150,7 +150,7 @@ class BpttPolicyLearner:
     self.cfg = cfg
     # 只把 actor 参数交给这个优化器；critic 有自己单独的优化器。
     # actor 优化器只接收策略参数；模型虽在计算图中传递输入梯度，但不会被本优化器更新。
-    self.actor_params = list(self.actor.parameters())
+    self.actor_params = [p for p in self.actor.parameters() if p.requires_grad]
     self.actor_optimizers = build_optimizers(
       [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
     )

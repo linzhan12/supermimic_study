@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 # time.time 用于统计墙钟耗时，区分物理采集区间、世界模型训练和策略训练耗时。
+import json
 import time
 # ThreadPoolExecutor 创建单工作线程，后台上传模型；Future 是上传任务的句柄。
 # 保存下个版本前调用 Future.result() 等待上次任务，防止上传还在读文件时就覆盖文件。
@@ -68,6 +69,7 @@ from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 # 来自 supermimic/src/supermimic/envs/multi_task_world_model_env.py：多任务可微想象环境。
 # 用 Dynamics 推进预测状态，提供任务目标、跟踪奖励和软终止，不直接推进 MuJoCo。
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.envs.velocity_world_model_env import VelocityWorldModelEnv
 # 来自 supermimic/src/supermimic/learners/policy_learner.py：策略训练算法和对应配置。
 # BpttPolicyLearner 在模型中展开动作序列，用回报对 actor 反传；Cfg 决定批大小、步数和学习率等。
 # ActorCriticPolicyLearner 在此基础上增加末端价值估计和 critic 拟合；其 Cfg 类型也用于选择算法分支。
@@ -107,6 +109,7 @@ from supermimic.tasks.task_spec import (
   build_actor_obs_td,
   resolve_task_specs,
 )
+from supermimic.tasks.velocity_tracking import IndependentVelocityCommand
 # 来自 supermimic/src/supermimic/utils/helpers.py：extract_action_scale_offset 读取动作缩放与偏置，
 # 使 Dynamics 与物理环境采用相同命令尺度；unpack_obs_dims 读取 full_state 和 goal 的特征宽度。
 from supermimic.utils.helpers import (
@@ -139,6 +142,7 @@ class BaseRunnerCfg:
   run_name: str | None = None
   # 可选的世界模型初始化来源；这里恢复模型权重，不恢复经验池或优化器训练进度。
   wandb_run_path: str | None = None
+  init_checkpoint_dir: str | None = None
   # 当前文件没有读取 headless；它不是本训练循环里实际控制显示窗口的开关。
   headless: bool = True
   # 每个物理环境保存 1000 个时间槽；总缓存条数约为 num_envs × buffer_size。
@@ -192,6 +196,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   critic_hidden_dims: tuple[int, ...] = (256, 128)
   latent_bc_weight: float = 1e-1
   """非锚点编码器向同状态锚点潜变量对齐的损失权重；设为 0 则关闭。"""
+  independent_velocity: bool = False
+  """Fine-tune the velocity encoder with independent flat-ground commands."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -522,6 +528,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     if self.cfg.wandb_run_path is not None:
       load_wandb_checkpoint(self.cfg.wandb_run_path, wm, self.device)
+    if self.cfg.init_checkpoint_dir is not None:
+      path = Path(self.cfg.init_checkpoint_dir).expanduser() / "world_model.pt"
+      wm.load_bundle(torch.load(path, map_location=self.device, weights_only=True))
 
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
@@ -776,6 +785,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     # detach 断开动作计算图，clone 保存独立快照；物理采集的数据作为监督标签存储。
     # prev_action 在执行本步前读取，否则动作管理器更新后会丢失上一动作。
+    if self.env.clip_actions is not None:
+      actions = actions.clamp(-self.env.clip_actions, self.env.clip_actions)
     raw_actions = actions.detach().clone()
     prev_action = self.action_manager.action.clone()
 
@@ -937,6 +948,16 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   """
 
   # 函数作用：在公共模型和回放准备好后，建立本算法的策略、想象环境及学习器。
+  def _buffer_schema(self) -> dict[str, FieldSpec]:
+    schema = super()._buffer_schema()
+    if self.cfg.independent_velocity:
+      schema.update(
+        velocity_command=FieldSpec(3),
+        velocity_hold_steps=FieldSpec(dtype=torch.long),
+        velocity_command_category=FieldSpec(dtype=torch.long),
+      )
+    return schema
+
   def _init_policy(self) -> None:
     """在公共模型和回放准备好后，建立本算法的策略、想象环境及学习器。
 
@@ -951,6 +972,16 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     任务列表须保留 motion 作为锚点；该约束由多任务环境进一步检查。
     """
     actor = build_actor(self.cfg, self._wm, self.device)
+    if self.cfg.init_checkpoint_dir is not None:
+      path = Path(self.cfg.init_checkpoint_dir).expanduser() / "actor.pt"
+      actor.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+    self._velocity_command = None
+    if self.cfg.independent_velocity:
+      actor.requires_grad_(False)
+      actor.encoders["velocity"].requires_grad_(True)
+      term = self.env.unwrapped.command_manager.get_term("velocity")
+      assert isinstance(term, IndependentVelocityCommand)
+      self._velocity_command = term
     # 只为占有非零批次比例的任务生成目标；编码器仍按配置的任务顺序分配槽位。
     self._active_task_specs = [
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
@@ -964,6 +995,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     # 只取价值网络输入宽度；actor 已由 build_actor 根据多任务接口创建。
     # 价值网络输出 1 个标量，即每个想象状态的未来折扣回报估计。
     _, critic_input_dim = self._policy_input_dims()
+    if self._velocity_command is not None:
+      critic_input_dim += 4 - self._num_goals
     critic = build_mlp(
       critic_input_dim,
       self.cfg.critic_hidden_dims,
@@ -974,17 +1007,22 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     # 想象并行数来自 policy.batch_size，不要求等于物理环境数。
     # 共享 _dynamics 与 replay_buffer，所以模型更新后想象环境立即使用最新参数。
-    self.wm_env = MultiTaskWorldModelEnv(
+    wm_env_kwargs = dict(
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
       batch_size=policy_cfg.batch_size,
       replay_buffer=self.replay_buffer,
-      task_specs=self._active_task_specs,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
+    if self._velocity_command is not None:
+      self.wm_env = VelocityWorldModelEnv(**wm_env_kwargs)
+    else:
+      self.wm_env = MultiTaskWorldModelEnv(
+        **wm_env_kwargs, task_specs=self._active_task_specs
+      )
     # CUDA 可用时编译 reset 和 step 的张量路径以降低 Python 开销；算法逻辑不变。
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
@@ -1033,10 +1071,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     )
     # 每个活跃任务为整批环境生成目标；actor 再按槽位区间选择对应任务目标。
     # 目标必须使用动作执行前的 motion_times，与当前状态和输出动作时间对齐。
-    goals = {
-      ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
-      for ts in self._active_task_specs
-    }
+    if self._velocity_command is None:
+      goals = {
+        ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
+        for ts in self._active_task_specs
+      }
+    else:
+      # The command manager mutates its buffers after the physics step.
+      goals = {"velocity": self._velocity_command.command.clone()}
     return build_actor_obs_td(goals, self._collection_history(sensor))
 
   # 函数作用：确认入口正确解析了重置模式，并按需创建 return 采样器。
@@ -1115,6 +1157,12 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       extra_fields = {"sim_ctx": sim_ctx}
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
+      if self._velocity_command is not None:
+        extra_fields.update(
+          velocity_command=actor_td["goal_velocity"],
+          velocity_hold_steps=self._velocity_command.steps_left.clone(),
+          velocity_command_category=self._velocity_command.category.clone(),
+        )
 
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,
@@ -1160,6 +1208,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     调用者 _flush_normalization 在推理作用域外执行它。
     """
     # 经验归一化器通常只在训练模式接收统计更新；此处显式开启，逐批输入新数据。
+    if self.cfg.independent_velocity:
+      return
     self.policy_learner.actor.train()
     for actor_td in actor_inputs:
       self.policy_learner.actor.update_normalization(actor_td)
@@ -1186,6 +1236,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     # 世界模型先学习新的物理数据，策略随后利用当前模型展开想象轨迹。
     # 初始缓存不足 horizon 时跳过更新，日志和 checkpoint 按配置间隔处理。
     log_dir = self._create_log_dir()
+    if self.cfg.independent_velocity:
+      (log_dir / "local_config.json").write_text(json.dumps({
+        "task_id": self.task_id,
+        "runner_cfg": asdict(self.cfg),
+        "motion_file": self.motion_cmd.cfg.motion_file,
+        "seed": self.env.cfg.seed,
+        "num_envs": self.env.num_envs,
+        "control_dt_s": self.env.unwrapped.step_dt,
+      }, indent=2) + "\n")
     self._init_wandb(log_dir)
 
     self.env.reset()
@@ -1270,7 +1329,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
+      if step % self.cfg.save_interval == 0 or (
+        self.cfg.independent_velocity and step == self.cfg.max_iterations - 1
+      ):
         assert wandb.run is not None  # 进入循环前已初始化 W&B 运行
         # 旧版本上传任务结束后才能覆盖本地同名文件。
         # 上传线程可能仍在读取本地文件；先等上个版本上传完，再覆盖同名检查点。

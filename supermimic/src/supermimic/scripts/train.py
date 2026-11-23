@@ -39,6 +39,7 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.velocity_tracking import configure_velocity_env
 
 
 # @dataclass 为配置类自动生成初始化方法；类可以理解为配置对象的模板。
@@ -115,6 +116,14 @@ def main() -> None:
     config=mjlab.TYRO_FLAGS,
   )
 
+  if args.runner.init_checkpoint_dir and args.runner.wandb_run_path:
+    raise ValueError("Choose one checkpoint initialization source.")
+  if args.runner.independent_velocity:
+    if chosen_task != "SuperMimic-GenCoord-G1" or args.runner.representation != "gencoord":
+      raise ValueError("Independent velocity fine-tuning requires SuperMimic-GenCoord-G1.")
+    if not args.runner.init_checkpoint_dir or not args.motion_file:
+      raise ValueError("F1 requires a local checkpoint and local reference motion files.")
+
   # 若用户未指定设备，工具函数会在 CUDA 可用时选择 cuda:0，否则选择 cpu。
   device = setup_device(args.device)
   # f"...{变量}..." 是格式化字符串，花括号里的值会插入显示文本。
@@ -154,6 +163,12 @@ def main() -> None:
   args.env.commands["motion"].sampling_mode = (
     "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
   )
+
+  if args.runner.independent_velocity:
+    args.runner.slot_mix = {"motion": 0.0, "velocity": 1.0}
+    args.runner.latent_bc_weight = 0.0
+    args.runner.sampling_mode = "uniform"
+    configure_velocity_env(args.env)
 
   # 按最终配置、并行环境数和设备创建并包装物理仿真环境。
   # 前面对动作文件、表示和采样方式的配置应在此之前完成。

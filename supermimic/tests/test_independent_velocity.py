@@ -1,0 +1,81 @@
+from unittest.mock import Mock
+
+import torch
+from mjlab.utils.lab_api.math import quat_from_euler_xyz
+from tensordict import TensorDict
+
+from supermimic.envs.velocity_world_model_env import VelocityWorldModelEnv
+from supermimic.tasks.velocity_tracking import (
+  IndependentVelocityCommand,
+  VelocitySchedule,
+  heading_velocity,
+)
+from tests.conftest import make_mock_command_env, make_mock_representation
+
+
+def test_heading_velocity_uses_yaw_and_world_vertical_rate():
+  quat = quat_from_euler_xyz(
+    torch.tensor([0.4]), torch.tensor([-0.2]), torch.tensor([torch.pi / 2])
+  )
+  linear = torch.tensor([[0.3, 0.2, 0.8]])
+  angular = torch.tensor([[0.4, -0.7, 0.5]])
+  torch.testing.assert_close(
+    heading_velocity(quat, linear, angular), torch.tensor([[0.2, -0.3, 0.5]])
+  )
+
+
+def test_command_timer_keeps_zero_until_last_transition():
+  schedule = VelocitySchedule(0.02, "cpu")
+  replacement = torch.tensor([[0.35, 0.0, 0.4]])
+  schedule.sample = Mock(
+    return_value=(replacement, torch.tensor([50]), torch.tensor([5]))
+  )
+  zero = torch.zeros_like(replacement)
+  initial = (zero, torch.tensor([2]), torch.tensor([0]))
+  held = schedule.advance(*initial, elapsed=0)
+  torch.testing.assert_close(held, initial)
+  held = schedule.advance(*held)
+  torch.testing.assert_close(held, (zero, torch.tensor([1]), torch.tensor([0])))
+  torch.testing.assert_close(schedule.advance(*held), schedule.sample.return_value)
+
+
+def test_imagination_scores_old_command_before_refresh():
+  schedule = VelocitySchedule(0.02, "cpu")
+  schedule.sample = Mock(
+    return_value=(
+      torch.tensor([[0.5, 0.0, 0.0]]),
+      torch.tensor([80]),
+      torch.tensor([1]),
+    )
+  )
+  env = make_mock_command_env()
+  rep = make_mock_representation(rep_state_dim=68)
+  command = Mock(spec=IndependentVelocityCommand, schedule=schedule)
+  motion = env.unwrapped.command_manager.get_term.return_value
+  env.unwrapped.command_manager.get_term.side_effect = {
+    "velocity": command,
+    "motion": motion,
+  }.__getitem__
+  env.unwrapped.step_dt = 0.02
+  pose = torch.tensor([[0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0]])
+  dynamics = Mock(side_effect=lambda state, action, aux, ctx: (aux, state))
+  wm_env = VelocityWorldModelEnv(dynamics, rep, env, 1, Mock(), 1, 0.05)
+  rep.extract_aux_state.side_effect = lambda _: pose
+  rep.represent.side_effect = lambda state: torch.zeros((state.shape[0], 68))
+  batch = TensorDict(
+    {
+      "state": torch.zeros((1, 71)),
+      "prev_action": torch.zeros((1, 29)),
+      "sim_ctx": torch.zeros((1, 1)),
+      "velocity_command": torch.zeros((1, 3)),
+      "velocity_hold_steps": torch.ones(1, dtype=torch.long),
+      "velocity_command_category": torch.zeros(1, dtype=torch.long),
+    },
+    batch_size=[1],
+  )
+  obs = wm_env.reset(batch)
+  torch.testing.assert_close(obs["goal_velocity"], batch["velocity_command"])
+  obs, reward, done, _ = wm_env.step(batch["prev_action"])
+  torch.testing.assert_close(reward, torch.tensor([0.02]))
+  assert done.item() < 1e-6
+  torch.testing.assert_close(obs["goal_velocity"], schedule.sample.return_value[0])

@@ -95,8 +95,11 @@ class WorldModelEnv(ABC):
       raise ValueError(
         f"termination_softness must be positive, got {termination_softness}"
       )
-    terms = env.cfg.terminations
     self._termination_softness = termination_softness
+    self._configure_scoring(env)
+
+  def _configure_scoring(self, env: Any) -> None:
+    terms = env.cfg.terminations
     self._anchor_pos_threshold = terms["anchor_pos"].params["threshold"]
     self._anchor_ori_threshold = terms["anchor_ori"].params["threshold"]
 
@@ -278,6 +281,14 @@ class WorldModelEnv(ABC):
     )
     # 奖励的关节限位项和下一次传感器合成都依赖关节状态；最大坐标需要逆运动学恢复。
     next_joint_state = self.representation.joint_state(next_rep_state)
+    term_prob, reward = self._score_transition(
+      next_aux_state, next_rep_state, next_joint_state, action, last_action
+    )
+    return next_aux_state, next_rep_state, next_joint_state, term_prob, reward
+
+  def _score_transition(
+    self, next_aux_state, next_rep_state, next_joint_state, action, last_action
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state
     )
@@ -294,7 +305,7 @@ class WorldModelEnv(ABC):
       ref_body_lin_vel_w,
       ref_body_ang_vel_w,
     )
-    return next_aux_state, next_rep_state, next_joint_state, term_prob, reward
+    return term_prob, reward
 
   # 函数作用：将物理任务的高度和倾斜终止阈值平滑为可微结束权重。
   def _compute_term_prob(
@@ -340,6 +351,9 @@ class WorldModelEnv(ABC):
     """
     self.motion_times = batch["motion_time"]
     self._update_goal()
+    self._reset_sensors(batch)
+
+  def _reset_sensors(self, batch: TensorDict) -> None:
     if self.history_length > 1:
       self._past_sensors = self._warmstart_past_sensors(
         batch["sensor_window"], batch["pad_mask"]
