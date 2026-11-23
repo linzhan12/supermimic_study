@@ -87,3 +87,47 @@ OMP_NUM_THREADS=2 .venv/bin/python -u scripts/play_speed_test.py \
 `0.25` 的姿态权重通过了两个停步姿态门槛，也保留了完整参考能力。松杆末半秒的两组残余速度都接近零，此时可以直接比较站姿关节。有指令的转向阶段，左转平均前向速度从 `0.334` 降至 `0.254 m/s`，因此转向姿态改善和减速同时发生。四项移动阶段误差超过预设容差，**F2 整体筛查未通过**。阶段留在 F2，后续在相同起点和预算下检查姿态权重与速度误差的权衡。
 
 结论限于一个训练种子和一条留出片段，CPU 回放出现 29 条求解器迭代上限警告。逐步数据、汇总、评测日志及代码版本记录位于本机 `supermimic/outputs/f2-posture-s0-20261123/`，评测权重 SHA-256 为 `070756438dfd6d5b9c14051d546ca0160a356e9760ec1032721ad7a3e9d0eb71`。
+
+## 未达标诊断
+
+2,000 次外层迭代相当于 256,000 条真实仿真转移，按现有批量与回放调度约有 996 次策略更新。从本机离线日志提取的 F2 `Policy/reward` 在后半程趋平。该指标汇总 32 步想象轨迹上的速度、姿态回报和末端价值估计。
+
+| 外层迭代区间 | F2 平均想象回报 | F2 平均世界模型 `Loss/state` |
+| --- | ---: | ---: |
+| 1,000–1,450 | 3.4114 | 0.003365 |
+| 1,500–1,700 | 3.4228 | 0.002959 |
+| 1,750–1,950 | 3.4168 | 0.003002 |
+
+训练回报趋平，仍需按留出命令逐段判断。离线保存使用同名权重覆盖中间版本，因此目前只有 2,000 次迭代的闭环结果。单个最终点无法判定继续训练后，四个超差项会缩小还是保持。
+
+把 F1 和 F2 固定摇杆轨迹的步末状态统一代入 F2 奖励，用实际速度和足部平移速率以及由记录姿态重建的足部高度重算。以下是阶段内的平均速度项、乘过 `0.25` 的姿态项和两者相加的即时分数。
+
+| 阶段 | 速度项 F1 → F2 | 姿态项 F1 → F2 | 总分 F1 → F2 |
+| --- | ---: | ---: | ---: |
+| 近静止起步 | 0.905 → 0.863 | 0.115 → 0.168 | 1.020 → 1.031 |
+| 近静止用例左转 | 0.924 → 0.850 | 0.100 → 0.146 | 1.024 → 0.996 |
+| 近静止用例右转 | 0.940 → 0.879 | 0.114 → 0.138 | 1.054 → 1.017 |
+| 行走初态直走 | 0.862 → 0.825 | 0.131 → 0.147 | 0.993 → 0.972 |
+
+起步段的姿态收益足以补偿速度项损失，说明当前目标在该段确实允许用一些速度换姿态。左右转段则连即时总分也下降。左转最后半秒，F2 平均前向速度仍只有 `0.238 m/s`，F1 为 `0.329 m/s`。行走初态直走的偏航退化主要出现在前半秒，F2 偏航 MAE 为 `0.316 rad/s`，F1 为 `0.182 rad/s`。这几个现象给出了两类待区分因素，分别是训练预算对特定命令的影响，以及姿态、速度与转向过渡在当前目标中的权衡。统一重评分数是物理即时分数，和训练日志中的想象回报具有不同的时间尺度及采样分布。
+
+### 固定权重的预算复验
+
+先将外层迭代从 `2,000` 增加到 `6,000`，共 `768,000` 条物理转移。从同一预训练 checkpoint 重新开始，保持姿态权重 `0.25`、种子、数据、命令分布和其他参数相同。当前 checkpoint 文件保存模型权重，优化器与经验池没有保存，因此采用重新起跑的预算对照。
+
+```bash
+cd /home/hi/SuperMimic-Official/supermimic
+CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u \
+  src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
+  --device cuda:0 --num-envs 128 --env.seed 0 \
+  --motion-file '../data/lafan1_official/walk2_subject3.npz,../data/lafan1_official/walk3_subject3.npz' \
+  --runner.independent-velocity True --runner.posture-weight 0.25 \
+  --runner.init-checkpoint-dir logs/SuperMimic-GenCoord-G1/2026-11-17_17-55-41 \
+  --runner.actor-obs rep_state --runner.history-length 1 \
+  --runner.run-name f2-velocity-posture-6000-s0 \
+  --runner.max-iterations 6000 --runner.log-interval 50 --runner.save-interval 500 \
+  --runner.replay-ratio 4 --runner.wm.num-batches 1 --runner.wm.batch-size 128 \
+  --runner.wm.horizon 8 --runner.policy.batch-size 128 --runner.policy.horizon 32
+```
+
+复用同一闭环评测和原门槛，重点比较四个超差项与两个停步姿态项。若加预算后仍有同类超差，再回到 2,000 次预算单独比较较低姿态权重。若更长预算的 F2 达标，正式比较再配对运行相同预算的 F1。阶段出口仍要求姿态和速度联合达标。
