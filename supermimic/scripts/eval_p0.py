@@ -28,7 +28,11 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.tasks.task_spec import VelocityTaskCfg, build_actor_obs_td
-from supermimic.tasks.velocity_tracking import heading_velocity
+from supermimic.tasks.velocity_tracking import (
+  GAIT_START_PHASE,
+  advance_gait_phase,
+  heading_velocity,
+)
 
 STAND_START = (
   ("stand", 1.0, (0.0, 0.0, 0.0)),
@@ -48,6 +52,13 @@ STEADY_FORWARD = (
   ("stand", 1.0, (0.0, 0.0, 0.0)),
   ("forward", 6.0, (0.35, 0.0, 0.0)),
 )
+MULTISPEED_PROFILE = (
+  ("stand", 1.0, (0.0, 0.0, 0.0)),
+  ("slow", 3.0, (0.22, 0.0, 0.0)),
+  ("fast", 3.0, (0.50, 0.0, 0.0)),
+  ("medium", 3.0, (0.35, 0.0, 0.0)),
+  ("release", 2.0, (0.0, 0.0, 0.0)),
+)
 ROUTES = ("motion", "reference_velocity", "scripted_velocity")
 FALL_HEIGHT_M = 0.45
 FALL_TILT_RAD = math.pi / 3
@@ -66,6 +77,7 @@ class Config:
   record_posture: bool = False
   steady_forward: bool = False
   extra_forward_speeds: tuple[float, ...] = ()
+  multispeed_profile: bool = False
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -252,6 +264,10 @@ def evaluate(cfg: Config) -> None:
       label = f"steady_forward_{speed:.3f}".replace(".", "p")
       phases = (STEADY_FORWARD[0], ("forward", STEADY_FORWARD[1][1], (speed, 0.0, 0.0)))
       case_definitions.append((label, cfg.stand_frame, phases))
+    if cfg.multispeed_profile:
+      case_definitions.append(
+        ("multispeed_profile", cfg.stand_frame, MULTISPEED_PROFILE)
+      )
     for case, frame, phases in case_definitions:
       if case in scenarios:
         raise ValueError(f"Duplicate scenario: {case}")
@@ -294,7 +310,8 @@ def evaluate(cfg: Config) -> None:
     for case, (frame, schedule) in scenarios.items():
       initial = None
       case_summary = {"reference_frame": frame, "routes": {}}
-      routes = ("scripted_velocity",) if case.startswith("steady_forward") else ROUTES
+      scripted_only = case.startswith("steady_forward") or case == "multispeed_profile"
+      routes = ("scripted_velocity",) if scripted_only else ROUTES
       for route in routes:
         task = "motion" if route == "motion" else "velocity"
         actor.set_slot_mix({task: 1.0})
@@ -318,6 +335,7 @@ def evaluate(cfg: Config) -> None:
 
         history = None
         trace = []
+        gait_phase = ref_raw.new_full((1,), GAIT_START_PHASE)
         for step, (phase, scripted_target) in enumerate(schedule):
           ref_frame = int(motion_cmd.time_steps[0])
           if route == "scripted_velocity":
@@ -340,7 +358,11 @@ def evaluate(cfg: Config) -> None:
             if history is None
             else torch.cat((history[:, 1:], sensor), dim=1)
           )
-          action = actor(build_actor_obs_td({task: goal}, history))
+          actor_obs = build_actor_obs_td({task: goal}, history)
+          if runner_cfg.forward_gait_phase and task == "velocity":
+            actor_obs["gait_phase"] = gait_phase
+            gait_phase = advance_gait_phase(gait_phase, goal, dt)
+          action = actor(actor_obs)
           obs, reward, terminated, truncated, _ = sim_env.step(action)
           actual = heading_velocity(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w

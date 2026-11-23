@@ -13,7 +13,9 @@ from supermimic.tasks.velocity_posture import (
 )
 from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
+  advance_gait_phase,
   fall_severity,
+  gait_phase_features,
   turn_tracking_reward,
   velocity_reward,
 )
@@ -25,6 +27,7 @@ class VelocityWorldModelEnv(WorldModelEnv):
     term = env.unwrapped.command_manager.get_term("velocity")
     assert isinstance(term, IndependentVelocityCommand)
     self.schedule = term.schedule
+    self.use_gait_phase = term.gait_phase is not None
     self.dt = env.unwrapped.step_dt
     self.turn_tracking_weight = (
       env.cfg.rewards["turn_tracking"].weight
@@ -55,6 +58,7 @@ class VelocityWorldModelEnv(WorldModelEnv):
     self.command = batch["velocity_command"]
     self.steps_left = batch["velocity_hold_steps"]
     self.category = batch["velocity_command_category"]
+    self.gait_phase = batch["gait_phase"] if self.use_gait_phase else None
     self._reset_sensors(batch)
 
   def _score_transition(
@@ -83,23 +87,30 @@ class VelocityWorldModelEnv(WorldModelEnv):
     if self.arm_swing is not None:
       reward = reward + self.arm_swing_weight * self.arm_swing.score(q, self.command)
     if self.forward_gait is not None:
+      next_phase = None
+      if self.gait_phase is not None:
+        next_phase = advance_gait_phase(self.gait_phase, self.command, self.dt)
       reward = reward + self.forward_gait_weight * self.forward_gait.score(
-        height, q, qd, self.command
+        height, q, qd, self.command, next_phase
       )
     severity = fall_severity(height, quat)
     done = torch.sigmoid((severity - 1.0) / self._termination_softness)
     return done, reward * self.dt
 
   def _compute_commands(self) -> None:
+    if self.gait_phase is not None:
+      self.gait_phase = advance_gait_phase(self.gait_phase, self.command, self.dt)
     self.command, self.steps_left, self.category = self.schedule.advance(
       self.command, self.steps_left, self.category
     )
 
   def get_observations(self) -> TensorDict:
     hold_seconds = self.steps_left[:, None] * self.dt
-    critic = torch.cat(
-      (self.rep_state, self.command, hold_seconds, self.sim_ctx), dim=-1
-    )
-    return build_actor_obs_td(
-      {"velocity": self.command}, self._sensor_history(), critic
-    )
+    critic_state = (self.rep_state, self.command, hold_seconds, self.sim_ctx)
+    if self.gait_phase is not None:
+      critic_state += (gait_phase_features(self.gait_phase),)
+    critic = torch.cat(critic_state, dim=-1)
+    obs = build_actor_obs_td({"velocity": self.command}, self._sensor_history(), critic)
+    if self.gait_phase is not None:
+      obs["gait_phase"] = self.gait_phase
+    return obs

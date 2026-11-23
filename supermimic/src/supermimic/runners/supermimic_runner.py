@@ -86,7 +86,7 @@ from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerC
 # MultiEncoderAE 为各任务编码目标，再用共享解码器输出动作；build_mlp 构造普通张量 MLP。
 # 这里的 build_mlp 用于当前 runner 的 critic，与基类返回 MLPModel 的 _build_mlp 不同。
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
-from supermimic.tasks.forward_gait import ForwardGaitAdapter
+from supermimic.tasks.forward_gait import ForwardGaitAdapter, warm_start_gait_adapter
 # 来自 supermimic/src/supermimic/replay_buffer.py：FieldSpec 描述单字段宽度与类型，
 # ReplayBuffer 为每个物理环境维护独立时间环，提供不跨回合的连续窗口和历史起点采样。
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -224,6 +224,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Train a straight-walking adapter with at most this many radians of action correction."""
   forward_gait_command_fraction: float = 0.0
   """Probability of replacing an ordinary sampled command with forward walking."""
+  forward_gait_phase: bool = False
+  """Condition straight walking and its imitation reward on a continuous gait phase."""
+  forward_gait_teacher_steps: int = 0
+  """Supervised warm-start updates from the frozen full-reference policy."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -410,7 +414,8 @@ def build_actor(
   gait_adapter = None
   if cfg.forward_gait_action_limit:
     gait_adapter = ForwardGaitAdapter(
-      obs_dim, wm.action_names, wm.dynamics.action_scale, cfg.forward_gait_action_limit
+      obs_dim, wm.action_names, wm.dynamics.action_scale, cfg.forward_gait_action_limit,
+      use_phase=cfg.forward_gait_phase,
     )
   return MultiEncoderAE(
     obs_dim=obs_dim,
@@ -1003,6 +1008,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         velocity_hold_steps=FieldSpec(dtype=torch.long),
         velocity_command_category=FieldSpec(dtype=torch.long),
       )
+      if self.cfg.forward_gait_phase:
+        schema["gait_phase"] = FieldSpec()
     return schema
 
   def _init_policy(self) -> None:
@@ -1051,6 +1058,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       term = self.env.unwrapped.command_manager.get_term("velocity")
       assert isinstance(term, IndependentVelocityCommand)
       self._velocity_command = term
+      if self.cfg.forward_gait_teacher_steps:
+        gait = self.env.unwrapped.reward_manager.get_term_cfg("forward_gait").func
+        warm_start_gait_adapter(
+          actor, self._representation, self.motion, gait, self.cfg.forward_gait_teacher_steps
+        )
     # 只为占有非零批次比例的任务生成目标；编码器仍按配置的任务顺序分配槽位。
     self._active_task_specs = [
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
@@ -1065,7 +1077,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     # 价值网络输出 1 个标量，即每个想象状态的未来折扣回报估计。
     _, critic_input_dim = self._policy_input_dims()
     if self._velocity_command is not None:
-      critic_input_dim += 4 - self._num_goals
+      critic_input_dim += 4 + 2 * self.cfg.forward_gait_phase - self._num_goals
     critic = build_mlp(
       critic_input_dim,
       self.cfg.critic_hidden_dims,
@@ -1148,7 +1160,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     else:
       # The command manager mutates its buffers after the physics step.
       goals = {"velocity": self._velocity_command.command.clone()}
-    return build_actor_obs_td(goals, self._collection_history(sensor))
+    actor_td = build_actor_obs_td(goals, self._collection_history(sensor))
+    if self._velocity_command is not None and self._velocity_command.gait_phase is not None:
+      actor_td["gait_phase"] = self._velocity_command.gait_phase.clone()
+    return actor_td
 
   # 函数作用：确认入口正确解析了重置模式，并按需创建 return 采样器。
   def _configure_reset_sampling(self) -> None:
@@ -1232,6 +1247,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           velocity_hold_steps=self._velocity_command.steps_left.clone(),
           velocity_command_category=self._velocity_command.category.clone(),
         )
+        if self.cfg.forward_gait_phase:
+          extra_fields["gait_phase"] = actor_td["gait_phase"]
 
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,

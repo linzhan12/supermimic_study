@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,21 +10,23 @@ from mjlab.managers import RewardTermCfg
 from torch import nn
 
 from supermimic.models import build_mlp
-from supermimic.tasks.velocity_tracking import heading_velocity, physical_root
+from supermimic.tasks.task_spec import build_actor_obs_td
+from supermimic.tasks.velocity_tracking import (
+  IndependentVelocityCommand,
+  advance_gait_phase,
+  forward_gait_gate,
+  gait_cycle_hz,
+  gait_phase_features,
+  heading_velocity,
+  physical_root,
+)
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
-
-def forward_gait_gate(command: torch.Tensor) -> torch.Tensor:
-  """Ramp in at walking speeds and leave turns, lateral moves and stops alone."""
-  forward, lateral, yaw = command.unbind(-1)
-  return (
-    ((forward - 0.12) / 0.12).clamp(0, 1)
-    * (1 - (lateral / 0.10).square()).clamp_min(0)
-    * (1 - (yaw / 0.22).square()).clamp_min(0)
-  )
+  from supermimic.models import MultiEncoderAE
+  from supermimic.representations import StateRepresentation
 
 
 def walking_samples(
@@ -59,6 +62,8 @@ class ForwardGaitPrior:
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
     motion = env.command_manager.get_term("motion").motion
+    self.command_term = env.command_manager.get_term("velocity")
+    assert isinstance(self.command_term, IndependentVelocityCommand)
     rows, speed = walking_samples(motion, env.step_dt)
     self.columns = tuple(
       motion.fk.joint_names.index(f"{side}_{joint}_joint")
@@ -68,6 +73,16 @@ class ForwardGaitPrior:
     self.pose_width = motion.joint_pos.new_tensor((0.18, 0.22, 0.14, 0.26, 0.12) * 2)
     self.velocity_width = motion.joint_pos.new_tensor((1.9, 2.5, 1.9, 1.8, 1.2) * 2)
     self.height_width = 0.05
+    phase = None
+    if self.command_term.gait_phase is not None:
+      left, right = self.columns[0], self.columns[5]
+      leg = motion.joint_pos[rows, left] - motion.joint_pos[rows, right]
+      rate = motion.joint_vel[rows, left] - motion.joint_vel[rows, right]
+      scaled_rate = -rate / (math.tau * gait_cycle_hz(speed))
+      angles = torch.atan2(scaled_rate, leg) / math.tau
+      # Exclude frames whose legs are nearly static, including starts and finishes.
+      cyclic = leg.square() + scaled_rate.square() >= 0.22**2
+      rows, speed, phase = rows[cyclic], speed[cyclic], angles[cyclic]
     selected = []
     bins = (0.16, 0.26, 0.36, 0.46, 0.56, 0.66)
     counts = []
@@ -85,15 +100,22 @@ class ForwardGaitPrior:
       )
     print(f"[INFO] Forward gait reference frames by m/s {bins}: {counts}")
     selected = torch.cat(selected)
-    q = motion.joint_pos[rows[selected]][:, self.columns]
-    qd = motion.joint_vel[rows[selected]][:, self.columns]
-    height = motion.root_pos_w[rows[selected], 2]
+    self.reference_rows = rows[selected]
+    self.reference_speeds = speed[selected]
+    self.reference_phase = phase[selected] if phase is not None else None
+    self.phase_samples = None
+    if self.reference_phase is not None:
+      unit_phase = gait_phase_features(self.reference_phase)
+      self.phase_samples = torch.cat((unit_phase, -unit_phase))
+    q = motion.joint_pos[self.reference_rows][:, self.columns]
+    qd = motion.joint_vel[self.reference_rows][:, self.columns]
+    height = motion.root_pos_w[self.reference_rows, 2]
     sign = q.new_tensor((1, 1, 1, 1, -1) * 2)
     mirror = [5, 6, 7, 8, 9, 0, 1, 2, 3, 4]
     q = torch.cat((q, q[:, mirror] * sign))
     qd = torch.cat((qd, qd[:, mirror] * sign))
     height = height.repeat(2)
-    self.speeds = speed[selected].repeat(2)
+    self.speeds = self.reference_speeds.repeat(2)
     self.samples = self._features(height, q, qd)
     self.sample_norm_sq = self.samples.square().sum(-1)
 
@@ -111,7 +133,12 @@ class ForwardGaitPrior:
     )
 
   def score(
-    self, height: torch.Tensor, q: torch.Tensor, qd: torch.Tensor, command: torch.Tensor
+    self,
+    height: torch.Tensor,
+    q: torch.Tensor,
+    qd: torch.Tensor,
+    command: torch.Tensor,
+    phase: torch.Tensor | None = None,
   ) -> torch.Tensor:
     state = self._features(height, q[:, self.columns], qd[:, self.columns])
     distance = (
@@ -120,6 +147,10 @@ class ForwardGaitPrior:
       - 2 * state @ self.samples.T
     )
     speed_cost = ((command[:, :1] - self.speeds) / 0.085).square()
+    if self.phase_samples is not None:
+      assert phase is not None
+      phase_similarity = gait_phase_features(phase) @ self.phase_samples.T
+      distance = distance + 3 * (1 - phase_similarity.clamp(-1, 1))
     # A single nearby example preserves multimodal styles and opposite gait phases.
     cost = (distance.clamp_min(0) + speed_cost).min(-1).values
     return forward_gait_gate(command) / (1 + cost)
@@ -127,11 +158,13 @@ class ForwardGaitPrior:
   def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     height, _, _, _ = physical_root(env)
     robot = env.scene["robot"]
+    command = self.command_term.command
+    phase = self.command_term.gait_phase
+    next_phase = (
+      advance_gait_phase(phase, command, env.step_dt) if phase is not None else None
+    )
     return self.score(
-      height,
-      robot.data.joint_pos,
-      robot.data.joint_vel,
-      env.command_manager.get_command("velocity"),
+      height, robot.data.joint_pos, robot.data.joint_vel, command, next_phase
     )
 
 
@@ -144,6 +177,7 @@ class ForwardGaitAdapter(nn.Module):
     action_names: tuple[str, ...],
     scale: torch.Tensor,
     limit_rad: float,
+    use_phase: bool = False,
   ) -> None:
     super().__init__()
     joints = (
@@ -169,13 +203,77 @@ class ForwardGaitAdapter(nn.Module):
     self.register_buffer(
       "limits", limit_rad / scale.reshape(-1)[indices], persistent=False
     )
-    self.net = build_mlp(obs_dim + 3, (128, 128), output_dim=len(indices))
+    self.use_phase = use_phase
+    self.net = build_mlp(
+      obs_dim + 3 + 2 * use_phase, (128, 128), output_dim=len(indices)
+    )
     nn.init.zeros_(self.net[-1].weight)
     nn.init.zeros_(self.net[-1].bias)
 
   def forward(
-    self, action: torch.Tensor, normalized_state: torch.Tensor, command: torch.Tensor
+    self,
+    action: torch.Tensor,
+    normalized_state: torch.Tensor,
+    command: torch.Tensor,
+    phase: torch.Tensor | None = None,
   ) -> torch.Tensor:
-    delta = self.net(torch.cat((normalized_state, command), dim=-1)).tanh()
+    features = (normalized_state, command)
+    if self.use_phase:
+      assert phase is not None
+      features += (gait_phase_features(phase),)
+    delta = self.net(torch.cat(features, dim=-1)).tanh()
     delta = delta * self.limits * forward_gait_gate(command)[..., None]
     return action.index_add(-1, self.indices, delta)
+
+
+def warm_start_gait_adapter(
+  actor: MultiEncoderAE,
+  representation: StateRepresentation,
+  motion: MotionLoader,
+  prior: ForwardGaitPrior,
+  steps: int,
+) -> None:
+  """Imitate the frozen motion branch at compatible speed and phase before rollouts."""
+  adapter = actor.forward_gait_adapter
+  assert isinstance(adapter, ForwardGaitAdapter) and prior.reference_phase is not None
+  motion_spec = next(spec for spec in actor.task_specs if spec.name == "motion")
+  rows = prior.reference_rows
+  with torch.no_grad():
+    full_state = torch.cat(
+      (
+        motion.root_pos_w[rows],
+        motion.root_quat_w[rows],
+        motion.joint_pos[rows],
+        motion.root_lin_vel_w[rows],
+        motion.root_ang_vel_w[rows],
+        motion.joint_vel[rows],
+      ),
+      dim=-1,
+    )
+    aux_state = representation.extract_aux_state(full_state)
+    goal = motion_spec.extract_training_goal(motion, rows, aux_state)
+    history = representation.represent(full_state)[:, None].expand(
+      -1, actor.history_length, -1
+    )
+    speed = prior.reference_speeds.clamp_max(0.55)
+    command = torch.stack(
+      (speed, torch.zeros_like(speed), torch.zeros_like(speed)), dim=-1
+    )
+    actor.set_slot_mix({"motion": 1.0})
+    teacher = actor(build_actor_obs_td({"motion": goal}, history))[:, adapter.indices]
+  actor.set_slot_mix({"velocity": 1.0})
+  optimizer = torch.optim.AdamW(adapter.parameters(), lr=8e-4)
+  for step in range(steps):
+    batch = torch.randint(len(rows), (128,), device=rows.device)
+    obs = build_actor_obs_td({"velocity": command[batch]}, history[batch])
+    obs["gait_phase"] = prior.reference_phase[batch]
+    predicted = actor(obs)[:, adapter.indices]
+    error = ((predicted - teacher[batch]) / adapter.limits).square().mean()
+    optimizer.zero_grad(set_to_none=True)
+    error.backward()
+    optimizer.step()
+    if step == 0 or step + 1 == steps:
+      print(
+        f"[INFO] Gait teacher step {step + 1}/{steps}: normalized action MSE {error.item():.5f}"
+      )
+  optimizer.zero_grad(set_to_none=True)

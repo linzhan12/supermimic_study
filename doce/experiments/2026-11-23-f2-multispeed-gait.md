@@ -54,3 +54,48 @@ OMP_NUM_THREADS=2 .venv/bin/python -u scripts/eval_p0.py \
 从 Berkeley 的 G1 重定向 AMASS 下载了 ACCAD 四条步行动作和 CMU 五条标为慢走的试次。源文件使用 IsaacLab AMP 的 29 个 G1 关节、30 Hz、`wxyz` 四元数。`scripts/convert_amp_g1_motion.py` 按关节名映射，平移和关节采用样条插值，旋转采用球面插值，按 50 Hz 重新计算速度。转换后用相同走速与连续性门槛检测。 [Berkeley 重定向库](https://huggingface.co/datasets/ember-lab-berkeley/AMASS_Retargeted_for_G1) · [IsaacLab AMP 文件格式](https://github.com/isaac-sim/IsaacLab/tree/main/source/isaaclab_tasks/isaaclab_tasks/direct/humanoid_amp/motions) · [CMU 慢走试次索引](https://mocap.cs.cmu.edu/search.php?maincat=3&subcat=2)
 
 ACCAD `B1-standtowalk` 保留 9 帧，`B2-walktostand`、`B3-walk1`、`B10-walkturnleft45` 均未保留。CMU `16_34` 保留 29 帧，`07_04`、`07_05`、`08_04`、`08_11` 均未保留。文件上的慢走标签无法替代机器人实际尺寸下的速度筛查。短片段先保留供起停或相位实验；本轮训练仅用了上述 LAFAN1 文件。外部文件保存在被 Git 忽略的 `supermimic/outputs/f2-external-{accad,cmu}-50hz/`，源自 AMASS 的动作适用其学术研究许可和子库条款。 [AMASS 许可](https://github.com/nghorbani/amass/blob/master/LICENSE.txt) · [上游重定向来源及许可](https://huggingface.co/datasets/fleaven/Retargeted_AMASS_for_robotics)
+
+## 连续相位和完整参考策略蒸馏
+
+对有明显左右腿运动的示范，用双髋俯仰差及其角速度估计相位，保留原片和镜像。增加速度相关的连续相位，供策略、价值网络和步态奖励使用。物理与想象从同一相位和同一步命令出发，连续直走换速时相位保持连续。原完整参考策略在同一参考状态输出教师动作，新增补偿头蒸馏其腿和手臂动作，再通过闭环训练调整速度。零速、明显横移或转向指令下关闭补偿。四环境 CPU 预检把同一物理步末状态送入想象评分，奖励差最大 `4.66×10⁻⁹`，相位对齐后刷新命令。227 个测试通过。
+
+运行 `2026-11-23_21-05-11` 从旧 F2 `17-22-01` 启动。训练候选的原 84 个 actor 张量逐项与旧 F2 相同，补偿头 10 个张量相对蒸馏起点全部更新。训练使用上轮五条本地动作，再加 `B1-standtowalk` 与 `16_34`。相位过滤后的五档帧数为 `706 / 770 / 223 / 64 / 80`。蒸馏 450 步，归一化动作 MSE 从初始抽样批的 `0.11935` 降至末批的 `0.00277`。闭环执行 3,600 次采集迭代，共 460,800 条物理转移。
+
+```bash
+MOTIONS="$MOTIONS,outputs/f2-external-accad-50hz/B1-standtowalk.npz,outputs/f2-external-cmu-50hz/16_34.npz"
+CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 \
+  --device cuda:0 --num-envs 128 --env.seed 0 --motion-file "$MOTIONS" \
+  --runner.independent-velocity True --runner.posture-weight 0.25 --runner.moving-posture-scale 0 \
+  --runner.arm-swing-control 0.45 --runner.arm-swing-roll 0.26 --runner.arm-swing-speed-gate 0.12 \
+  --runner.init-checkpoint-dir logs/SuperMimic-GenCoord-G1/2026-11-23_17-22-01 \
+  --runner.stop-encoder-init-dir logs/SuperMimic-GenCoord-G1/2026-11-23_16-35-09 \
+  --runner.forward-gait-weight 1.2 --runner.forward-gait-action-limit 0.60 --runner.forward-gait-command-fraction 0.55 \
+  --runner.forward-gait-phase True --runner.forward-gait-teacher-steps 450 \
+  --runner.actor-obs rep_state --runner.history-length 1 --runner.run-name f2-multispeed-phase-s0 \
+  --runner.max-iterations 3600 --runner.log-interval 100 --runner.save-interval 800 --runner.policy.lr 0.00012 \
+  --runner.replay-ratio 4 --runner.wm.num-batches 1 --runner.wm.batch-size 128 --runner.wm.horizon 8 \
+  --runner.policy.batch-size 128 --runner.policy.horizon 40
+```
+
+蒸馏后的物理探针在 `0.35 m/s` 指令下做出了 `42.7 / 40.2 cm` 的落脚间距及 `50.0 / 62.8 mm` 的离地峰值，膝摆幅达 `52.4° / 43.9°`，但平均前向速度为 `0.713 m/s`。闭环后跟速通过三档稳态和连续换速，离地高度及双足交替再次退化。
+
+| 目标（m/s） | 平均前向（m/s） | 膝摆幅（°） | 落脚间距（cm） | 左右离地峰值（mm） |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.22 | 0.219 | 8.0 / 14.6 | 13.2 / 4.5 | 0.4 / 2.1 |
+| 0.35 | 0.350 | 18.6 / 16.4 | 19.1 / −2.8 | 1.6 / 2.2 |
+| 0.50 | 0.487 | 27.7 / 18.8 | 26.2 / 7.8 | 2.1 / 3.7 |
+
+连续 `0.22 → 0.50 → 0.35 → 0` 的各段末半秒前向速度是 `0.218 / 0.478 / 0.348 / 0.005 m/s`。所有回放跑满。原筛查还有左转侧向误差超限 `0.04039 > 0.03 m/s` 及摆幅和协调不达标。**F2 仍未通过。** 结果表明速度接口的动作补偿有复现跨步的能力，闭环奖励允许低抬脚和不对称的替代做法。下一轮需直接约束足部浮升和交替支撑，验证能否同时保留蒸馏后的运动幅度和闭环跟速。
+
+新增 `check_f2_gait.py` 在原速度、停步、摆臂筛查基础上，检查三档前进的误差、膝摆幅、有效摆动次数及其对称性、落脚前后间距、脚底离地、换速和停止。门槛用于剔除已经观察到的贴地、小步和左右失衡，实际自然度仍由同速度范围完整参考的配对视频复核。
+
+```bash
+OMP_NUM_THREADS=2 .venv/bin/python -u scripts/eval_p0.py \
+  --checkpoint-dir logs/SuperMimic-GenCoord-G1/2026-11-23_21-05-11 \
+  --motion-file ../data/lafan1_official/walk1_subject1.npz --record-posture True \
+  --steady-forward True --extra-forward-speeds '(0.22, 0.50)' --multispeed-profile True \
+  --output-dir outputs/f2-multispeed-phase-s0-replay
+.venv/bin/python scripts/check_f2_gait.py outputs/f1-arm-check outputs/f2-multispeed-phase-s0-replay
+```
+
+外部样本另以 `convert_amp_g1_motion.py --speed-scale .65` 做纯时间缩放筛查。保持空间姿态轨迹并降低速度后，四条原慢走样本仍仅有 `07_05` 的 6 帧通过持续前走筛查。时间缩放改善速度覆盖的潜力受侧向、转向及连续性限制，本轮没有使用这些重定时文件训练。

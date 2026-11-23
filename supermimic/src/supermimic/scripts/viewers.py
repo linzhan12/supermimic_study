@@ -26,6 +26,7 @@ from supermimic.tasks.task_spec import (
   TaskSpec,
   build_actor_obs_td,
 )
+from supermimic.tasks.velocity_tracking import GAIT_START_PHASE, advance_gait_phase
 
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
@@ -85,6 +86,8 @@ class SuperMimicViewerMixin:
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions: torch.Tensor | None = None
+    self._gait_phase: torch.Tensor | None = None
+    self._wm_gait_phase: torch.Tensor | None = None
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
     if isinstance(self.representation, MaxCoordRepresentation):
@@ -98,6 +101,8 @@ class SuperMimicViewerMixin:
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
+    self._gait_phase = None
+    self._wm_gait_phase = None
 
   def set_task(self, name: str) -> None:
     """Switch the active task. Reroutes the actor through that task's encoder."""
@@ -105,6 +110,8 @@ class SuperMimicViewerMixin:
       raise ValueError(f"Unknown task {name!r}; have {list(self.task_specs)}")
     self.current_task = name
     self.policy.set_slot_mix({name: 1.0})
+    self._gait_phase = None
+    self._wm_gait_phase = None
 
   def set_raw_goal(self, task_name: str, idx: int, value: float) -> None:
     """Update one dimension of a task's raw goal."""
@@ -233,6 +240,7 @@ class SuperMimicViewerMixin:
           self.sim_ctx = self.sim_context.read(self.env.unwrapped)
           self._gt_history = None
           self._wm_history = None
+          self._wm_gait_phase = self._gait_phase
 
         if self.last_actions is None:
           self.last_actions = torch.zeros(
@@ -253,6 +261,16 @@ class SuperMimicViewerMixin:
         actor_obs = build_actor_obs_td(
           {self.current_task: actor_goal}, self._gt_history
         )
+        adapter = getattr(self.policy, "forward_gait_adapter", None)
+        phase_enabled = (
+          self.current_task == "velocity" and adapter is not None and adapter.use_phase
+        )
+        dt = self.env.unwrapped.step_dt
+        if phase_enabled:
+          if self._gait_phase is None:
+            self._gait_phase = actor_goal.new_full((len(actor_goal),), GAIT_START_PHASE)
+          actor_obs["gait_phase"] = self._gait_phase
+          self._gait_phase = advance_gait_phase(self._gait_phase, actor_goal, dt)
         actions = self.policy(actor_obs)
 
         # Env Step (Ground Truth simulation)
@@ -280,6 +298,13 @@ class SuperMimicViewerMixin:
         wm_actor_obs = build_actor_obs_td(
           {self.current_task: wm_actor_goal}, self._wm_history
         )
+        if phase_enabled:
+          if self._wm_gait_phase is None:
+            self._wm_gait_phase = actor_obs["gait_phase"]
+          wm_actor_obs["gait_phase"] = self._wm_gait_phase
+          self._wm_gait_phase = advance_gait_phase(
+            self._wm_gait_phase, wm_actor_goal, dt
+          )
         wm_actions = self.policy(wm_actor_obs)
 
         next_aux, next_rep_state = self.dynamics(
@@ -327,6 +352,8 @@ class SuperMimicViewerMixin:
           self.step_in_rollout = 0
           self.curr_wm_aux = None
           self.last_actions = None
+        if dones.any():
+          self._gait_phase = None
       return True
     except Exception as exc:
       self._last_error = f"{type(exc).__name__}: {exc}"

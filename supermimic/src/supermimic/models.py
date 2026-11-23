@@ -353,7 +353,8 @@ class MultiEncoderAE(nn.Module):
         if self.arm_swing_control is not None:
           adjusted = self.arm_swing_control(adjusted, obs_td["history"][lo:hi, -1], command)
         if self.forward_gait_adapter is not None:
-          adjusted = self.forward_gait_adapter(adjusted, history_n[lo:hi, -1], command)
+          phase = obs_td["gait_phase"][lo:hi] if self.forward_gait_adapter.use_phase else None
+          adjusted = self.forward_gait_adapter(adjusted, history_n[lo:hi, -1], command, phase)
         actions = torch.cat((actions[:lo], adjusted, actions[hi:]), dim=0)
     return actions
 

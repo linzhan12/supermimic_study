@@ -1,5 +1,6 @@
 from unittest.mock import Mock
 
+import pytest
 import torch
 from mjlab.utils.lab_api.math import quat_from_euler_xyz
 from tensordict import TensorDict
@@ -8,6 +9,7 @@ from supermimic.envs.velocity_world_model_env import VelocityWorldModelEnv
 from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
   VelocitySchedule,
+  advance_gait_phase,
   heading_velocity,
 )
 from tests.conftest import make_mock_command_env, make_mock_representation
@@ -39,7 +41,8 @@ def test_command_timer_keeps_zero_until_last_transition():
   torch.testing.assert_close(schedule.advance(*held), schedule.sample.return_value)
 
 
-def test_imagination_scores_old_command_before_refresh():
+@pytest.mark.parametrize("with_phase", (False, True))
+def test_imagination_scores_old_command_before_refresh(with_phase):
   schedule = VelocitySchedule(0.02, "cpu")
   schedule.sample = Mock(
     return_value=(
@@ -50,7 +53,10 @@ def test_imagination_scores_old_command_before_refresh():
   )
   env = make_mock_command_env()
   rep = make_mock_representation(rep_state_dim=68)
-  command = Mock(spec=IndependentVelocityCommand, schedule=schedule)
+  initial_phase = torch.tensor([0.9]) if with_phase else None
+  command = Mock(
+    spec=IndependentVelocityCommand, schedule=schedule, gait_phase=initial_phase
+  )
   motion = env.unwrapped.command_manager.get_term.return_value
   env.unwrapped.command_manager.get_term.side_effect = {
     "velocity": command,
@@ -73,9 +79,24 @@ def test_imagination_scores_old_command_before_refresh():
     },
     batch_size=[1],
   )
+  if with_phase:
+    batch["gait_phase"] = initial_phase
   obs = wm_env.reset(batch)
   torch.testing.assert_close(obs["goal_velocity"], batch["velocity_command"])
+  if with_phase:
+    torch.testing.assert_close(obs["gait_phase"], initial_phase)
   obs, reward, done, _ = wm_env.step(batch["prev_action"])
   torch.testing.assert_close(reward, torch.tensor([0.02]))
   assert done.item() < 1e-6
   torch.testing.assert_close(obs["goal_velocity"], schedule.sample.return_value[0])
+  if with_phase:
+    torch.testing.assert_close(obs["gait_phase"], torch.tensor([0.25]))
+
+
+def test_walking_clock_advances_continuously_across_speed_changes():
+  phase = torch.tensor([0.99, 0.25, 0.80])
+  command = torch.tensor([[0.22, 0.0, 0.0], [0.50, 0.0, 0.0], [0.35, 0.0, 0.4]])
+  new_phase = advance_gait_phase(phase, command, 0.02)
+  torch.testing.assert_close(
+    new_phase, torch.tensor([0.00352, 0.268, 0.25]), atol=1e-7, rtol=0
+  )

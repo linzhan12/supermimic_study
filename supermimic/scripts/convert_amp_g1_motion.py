@@ -10,7 +10,9 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation, Slerp
 
 
-def convert(source: Path, joint_names: list[str]) -> dict[str, np.ndarray]:
+def convert(
+  source: Path, joint_names: list[str], speed_scale: float = 1.0
+) -> dict[str, np.ndarray]:
   with np.load(source, allow_pickle=False) as data:
     fps = float(data["fps"].item())
     positions = data["dof_positions"]
@@ -28,7 +30,7 @@ def convert(source: Path, joint_names: list[str]) -> dict[str, np.ndarray]:
   if not np.allclose(np.linalg.norm(quat, axis=-1), 1.0, atol=1e-3):
     raise ValueError(f"{source}: invalid pelvis quaternions.")
 
-  source_time = np.arange(len(root)) / fps
+  source_time = np.arange(len(root)) / (fps * speed_scale)
   time = np.arange(int(np.floor(source_time[-1] * 50 + 1e-8)) + 1) / 50
   if len(time) < 3:
     raise ValueError(f"{source}: less than three output frames.")
@@ -58,7 +60,15 @@ def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("output", type=Path)
   parser.add_argument("input", type=Path, nargs="+")
+  parser.add_argument(
+    "--speed-scale",
+    type=float,
+    default=1.0,
+    help="Multiply clip playback speed by this factor.",
+  )
   args = parser.parse_args()
+  if not np.isfinite(args.speed_scale) or args.speed_scale <= 0:
+    parser.error("--speed-scale must be finite and positive.")
   model = mujoco.MjModel.from_xml_path(str(G1_XML))
   names = [
     model.joint(i).name
@@ -68,7 +78,7 @@ def main() -> None:
   args.output.mkdir(parents=True, exist_ok=True)
   for source in args.input:
     output = args.output / source.name
-    fields = convert(source, names)
+    fields = convert(source, names, args.speed_scale)
     with output.open("xb") as stream:
       np.savez_compressed(stream, **fields)
     print(f"{output}: {len(fields['joint_pos'])} frames at 50 Hz")
