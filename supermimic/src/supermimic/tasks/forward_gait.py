@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from mjlab.managers import RewardTermCfg
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
@@ -71,6 +73,7 @@ class ForwardGaitPrior:
     if use_physical_demos:
       motion = MotionLoader(list(cfg.reference_files), motion.fk, device=env.device)
     self.reference_motion = motion
+    self.reference_files = cfg.reference_files if use_physical_demos else ()
     self.command_term = env.command_manager.get_term("velocity")
     assert isinstance(self.command_term, IndependentVelocityCommand)
     # Use a stride-length window for tracker rollouts so natural lateral transfer
@@ -211,6 +214,7 @@ class FullBodyGaitRewardCfg(RewardTermCfg):
   reference_files: tuple[str, ...] = ()
   transfer_style: bool = False
   foot_orientation: bool = False
+  foot_placement: bool = False
 
 
 class FullBodyGaitPrior(ForwardGaitPrior):
@@ -228,6 +232,7 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     quat = motion.root_quat_w[rows]
     self.style_fk = None
     self.track_feet = isinstance(cfg, FullBodyGaitRewardCfg) and cfg.foot_orientation
+    self.foot_offsets = None
     if isinstance(cfg, FullBodyGaitRewardCfg) and cfg.transfer_style:
       robot = env.scene["robot"]
       bodies = ("torso_link",)
@@ -241,6 +246,10 @@ class FullBodyGaitPrior(ForwardGaitPrior):
         body_indices,
         device=env.device,
       )
+      if cfg.foot_placement:
+        site_rows, _ = robot.find_sites(("left_foot", "right_foot"), preserve_order=True)
+        site_ids = robot.indexing.site_ids[site_rows].cpu()
+        self.foot_offsets = q.new_tensor(env.sim.mj_model.site_pos[site_ids])
     transfer = self._transfer(
       motion.root_pos_w[rows, 2], quat, motion.root_lin_vel_w[rows], q
     )
@@ -250,8 +259,13 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     split = len(transfer_sign)
     mirrored_transfer = transfer[:, :split] * q.new_tensor(transfer_sign)
     if self.track_feet:
-      feet = transfer[:, split:].reshape(-1, 2, 2).flip(1) * q.new_tensor((-1, 1))
-      mirrored_transfer = torch.cat((mirrored_transfer, feet.flatten(1)), dim=-1)
+      axes = transfer[:, split : split + 4].reshape(-1, 2, 2).flip(1)
+      mirrored_axes = (axes * q.new_tensor((-1, 1))).flatten(1)
+      mirrored_transfer = torch.cat((mirrored_transfer, mirrored_axes), dim=-1)
+    if self.foot_offsets is not None:
+      feet = transfer[:, -6:].reshape(-1, 2, 3).flip(1)
+      mirrored_feet = (feet * q.new_tensor((1, -1, 1))).flatten(1)
+      mirrored_transfer = torch.cat((mirrored_transfer, mirrored_feet), dim=-1)
     self.body_samples = torch.cat(
       (
         torch.cat((q, qd, transfer), dim=-1),
@@ -298,8 +312,9 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     up = quat_apply_inverse(quat, world_up)
     features = (height[:, None], up, heading[:, 1:2], linear_w[:, 2:3])
     if self.style_fk is not None:
-      _, orientation, _, _ = self.style_fk(
-        zeros, quat, q, zeros, zeros, torch.zeros_like(q)
+      root_position = torch.cat((zeros[:, :2], height[:, None]), dim=-1)
+      position, orientation, _, _ = self.style_fk(
+        root_position, quat, q, zeros, zeros, torch.zeros_like(q)
       )
       torso_up = quat_apply_inverse(orientation[:, 0], world_up)
       features += (torso_up[:, :2],)
@@ -309,6 +324,13 @@ class FullBodyGaitPrior(ForwardGaitPrior):
         heading_quat = yaw_quat(quat)[:, None].expand(-1, 2, -1)
         forward_heading = quat_apply_inverse(heading_quat, forward_w)
         features += (forward_heading[..., 1:].flatten(1),)
+        if self.foot_offsets is not None:
+          foot_offset_w = quat_apply(
+            orientation[:, 1:], self.foot_offsets.expand_as(foot_axis)
+          )
+          site_w = position[:, 1:] + foot_offset_w
+          site_heading = quat_apply_inverse(heading_quat, site_w)
+          features += (site_heading.flatten(1),)
     return torch.cat(features, dim=-1)
 
   def score(
@@ -343,8 +365,14 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     )
     if self.track_feet:
       foot_widths = difference.new_tensor((0.13, 0.20, 0.13, 0.20))
-      foot_error = (difference[:, n_transfer:] / foot_widths).square().mean(-1)
+      foot_error = (
+        (difference[:, n_transfer : n_transfer + 4] / foot_widths).square().mean(-1)
+      )
       transfer_error = transfer_error + 0.8 * foot_error
+    if self.foot_offsets is not None:
+      placement_widths = difference.new_tensor((0.07, 0.05, 0.025) * 2)
+      placement_error = (difference[:, -6:] / placement_widths).square().mean(-1)
+      transfer_error = transfer_error + 1.3 * placement_error
     return forward_gait_gate(command) / (
       1 + 0.60 * q_error + 0.17 * qd_error + 0.42 * transfer_error
     )
@@ -484,11 +512,52 @@ class G1SagittalReflection(nn.Module):
     return 0.5 * self.blend * forward_gait_gate(command)[..., None]
 
 
+def recorded_gait_actions(
+  prior: ForwardGaitPrior, action_names: tuple[str, ...]
+) -> torch.Tensor | None:
+  """Read teacher controls for the transition after each selected physical pose."""
+  if not prior.reference_files or (
+    len(prior.reference_files) == 1 and Path(prior.reference_files[0]).is_dir()
+  ):
+    return None
+  motion = prior.reference_motion
+  ends = motion.motion_ends.tolist()
+  actions = []
+  for path, start, end in zip(prior.reference_files, [0, *ends[:-1]], ends, strict=True):
+    with np.load(path, allow_pickle=False) as demo:
+      if "executed_action" not in demo:
+        continue
+      action = demo["executed_action"]
+      if (
+        "action_names" not in demo
+        or tuple(demo["action_names"].tolist()) != action_names
+        or action.shape != (end - start, len(action_names))
+        or not np.isfinite(action).all()
+      ):
+        raise ValueError(f"{path}: invalid recorded action samples or joint order.")
+      actions.append(action)
+  if not actions:
+    return None
+  if len(actions) != len(ends):
+    raise ValueError("Provide executed actions for every physical gait demonstration.")
+  rows = prior.reference_rows
+  # A trace stores the action that produced its row's state. For that state as
+  # policy input, supervise with the action in the next row of the same clip.
+  clip = torch.bucketize(rows, motion.motion_ends, right=True)
+  if (rows + 1 >= motion.motion_ends[clip]).any():
+    raise ValueError("Selected a terminal demonstration state with no next action.")
+  controls = torch.as_tensor(
+    np.concatenate(actions), device=rows.device, dtype=motion.joint_pos.dtype
+  )
+  return controls[rows + 1]
+
+
 def warm_start_gait_adapter(
   actor: MultiEncoderAE,
   representation: StateRepresentation,
   prior: ForwardGaitPrior,
   steps: int,
+  action_names: tuple[str, ...],
 ) -> None:
   """Imitate the frozen motion branch at compatible speed and phase before rollouts."""
   adapter = actor.forward_gait_adapter
@@ -508,8 +577,6 @@ def warm_start_gait_adapter(
       ),
       dim=-1,
     )
-    aux_state = representation.extract_aux_state(full_state)
-    goal = motion_spec.extract_training_goal(motion, rows, aux_state)
     history = representation.represent(full_state)[:, None].expand(
       -1, actor.history_length, -1
     )
@@ -517,8 +584,15 @@ def warm_start_gait_adapter(
     command = torch.stack(
       (speed, torch.zeros_like(speed), torch.zeros_like(speed)), dim=-1
     )
-    actor.set_slot_mix({"motion": 1.0})
-    teacher = actor(build_actor_obs_td({"motion": goal}, history))[:, adapter.indices]
+    teacher = recorded_gait_actions(prior, action_names)
+    if teacher is None:
+      aux_state = representation.extract_aux_state(full_state)
+      goal = motion_spec.extract_training_goal(motion, rows, aux_state)
+      actor.set_slot_mix({"motion": 1.0})
+      teacher = actor(build_actor_obs_td({"motion": goal}, history))
+    else:
+      print("[INFO] Gait teacher uses actions recorded in physical reference rollouts.")
+    teacher = teacher[:, adapter.indices]
   actor.set_slot_mix({"velocity": 1.0})
   optimizer = torch.optim.AdamW(adapter.parameters(), lr=8e-4)
   for step in range(steps):

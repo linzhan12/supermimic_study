@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+from itertools import islice
 from pathlib import Path
 
 import mujoco
@@ -180,6 +181,61 @@ def metrics(
   }
 
 
+def render_comparison(
+  output: Path, traces: list[tuple[str, list[dict], list[str]]], dt: float
+) -> None:
+  from PIL import Image, ImageDraw
+
+  spec = mujoco.MjSpec.from_file(str(G1_XML))
+  spec.worldbody.add_geom(
+    type=mujoco.mjtGeom.mjGEOM_PLANE,
+    size=[30, 30, 0.1],
+    rgba=[0.18, 0.22, 0.28, 1.0],
+  )
+  model = spec.compile()
+  data = mujoco.MjData(model)
+  camera = mujoco.MjvCamera()
+  camera.distance = 2.35
+  camera.elevation = -6.0
+  root = model.joint(0).qposadr.item()
+  columns = []
+  for label, rows, names in traces:
+    joints = [model.joint(name).qposadr.item() for name in names]
+    start = np.asarray(rows[0]["pelvis_position_w_m"])[:2]
+    travel = np.asarray(rows[-1]["pelvis_position_w_m"])[:2] - start
+    heading = np.rad2deg(np.arctan2(travel[1], travel[0]))
+    columns.append((label, rows, joints, start, travel, heading))
+
+  width, height = 400, 246
+  frames = []
+  with mujoco.Renderer(model, height=height, width=width) as renderer:
+    for step in range(0, min(len(rows) for _, rows, _ in traces), 2):
+      frame = Image.new("RGB", (width * len(columns), height * 2))
+      for col, (label, rows, joints, start, travel, heading) in enumerate(columns):
+        row = rows[step]
+        data.qpos[root : root + 3] = row["pelvis_position_w_m"]
+        data.qpos[root + 3 : root + 7] = row["pelvis_quaternion_wxyz"]
+        data.qpos[joints] = row["posture"]["joint_pos_rad"]
+        mujoco.mj_forward(model, data)
+        # Follow the mean path so the pelvis' lateral transfer remains visible.
+        camera.lookat[:2] = start + travel * step / (len(rows) - 1)
+        camera.lookat[2] = 0.67
+        for panel, (view, offset) in enumerate((("side", 90), ("front", 180))):
+          camera.azimuth = heading + offset
+          renderer.update_scene(data, camera=camera)
+          snapshot = Image.fromarray(renderer.render())
+          draw = ImageDraw.Draw(snapshot)
+          draw.rectangle((0, 0, width, 24), fill="#20262d")
+          speed = row["actual_velocity"][0]
+          draw.text((8, 6), f"{label} | {view} | {speed:.2f} m/s", fill="white")
+          frame.paste(snapshot, (col * width, panel * height))
+      frames.append(frame)
+  frames[0].save(
+    output, save_all=True, append_images=frames[1:], duration=round(2_000 * dt), loop=0
+  )
+  frames[len(frames) // 3].save(output.with_suffix(".png"))
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument(
@@ -190,24 +246,34 @@ def main() -> None:
     metavar=("LABEL", "JSONL", "FIRST_ROW", "END_ROW"),
     help="Compare the zero-based row interval [FIRST_ROW, END_ROW) in each P0 trace.",
   )
+  parser.add_argument("--replay-gif", type=Path, help="Render paired side and front views.")
   args = parser.parse_args()
+  if args.replay_gif and args.replay_gif.suffix.lower() != ".gif":
+    parser.error("The replay output must use the .gif extension.")
   model = mujoco.MjModel.from_xml_path(str(G1_XML))
   result = {}
+  traces = []
+  frame_intervals = []
   for label, filename, start, stop in args.trace:
     path = Path(filename)
     summary = json.loads(path.with_name("summary.json").read_text())
+    first, end = int(start), int(stop)
+    if first < 0 or end - first < 5:
+      parser.error(f"{label}: specify a nonnegative trace window of at least five steps.")
     with path.open() as stream:
-      rows = [json.loads(line) for line in stream][int(start) : int(stop)]
-    if label in result or len(rows) != int(stop) - int(start) or len(rows) < 5:
-      parser.error(
-        f"{label}: duplicate label or incomplete trace window with fewer than five steps."
-      )
-    result[label] = metrics(
-      model,
-      rows,
-      summary["joint_position_order"],
-      rows[1]["state_time_s"] - rows[0]["state_time_s"],
-    )
+      rows = [json.loads(line) for line in islice(stream, first, end)]
+    if label in result or len(rows) != end - first:
+      parser.error(f"{label}: duplicate label or incomplete trace window.")
+    names = summary["joint_position_order"]
+    dt = rows[1]["state_time_s"] - rows[0]["state_time_s"]
+    result[label] = metrics(model, rows, names, dt)
+    if args.replay_gif:
+      traces.append((label, rows, names))
+      frame_intervals.append(dt)
+  if args.replay_gif:
+    if not np.allclose(frame_intervals, frame_intervals[0]):
+      parser.error("Comparison replay requires traces with the same timestep.")
+    render_comparison(args.replay_gif, traces, frame_intervals[0])
   print(json.dumps(result, indent=2, allow_nan=False))
 
 

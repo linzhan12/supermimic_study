@@ -52,6 +52,8 @@ def load_motion(path: Path) -> dict[str, np.ndarray]:
   }
   return {
     "joint_names": np.asarray(summary["joint_position_order"]),
+    "action_names": np.asarray(summary["action_order"]),
+    "executed_action": np.asarray([r["executed_action"] for r in rows], dtype=np.float32),
     **{key: value.astype(np.float32) for key, value in fields.items()},
   }
 

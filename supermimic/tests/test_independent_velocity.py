@@ -10,6 +10,7 @@ from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
   VelocitySchedule,
   advance_gait_phase,
+  forward_precision_reward,
   heading_velocity,
   velocity_reward,
 )
@@ -53,6 +54,7 @@ def test_imagination_scores_old_command_before_refresh(with_phase):
     )
   )
   env = make_mock_command_env()
+  env.cfg.rewards = {}
   rep = make_mock_representation(rep_state_dim=68)
   initial_phase = torch.tensor([0.9]) if with_phase else None
   command = Mock(
@@ -112,3 +114,14 @@ def test_gait_reward_allows_weight_transfer_and_keeps_steering_errors():
   gait = velocity_reward(quat, linear, angular, commands, allow_gait_lateral=True)
   assert gait[0] == 1 and original[0] < gait[0]
   torch.testing.assert_close(gait[1:], original[1:], atol=0, rtol=0)
+
+
+def test_forward_precision_scores_forward_and_yaw_during_weight_transfer():
+  quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(3, 1)
+  linear = torch.tensor([[0.35, 0.13, 0.0], [0.45, 0.13, 0.0], [0.35, 0.13, 0.0]])
+  angular = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.15]])
+  command = torch.tensor([[0.35, 0.0, 0.0]]).repeat(3, 1)
+  original = forward_precision_reward(quat, linear, angular, command)
+  walking = forward_precision_reward(quat, linear, angular, command, allow_gait_lateral=True)
+  assert walking[0] == 1 and original[0] < walking[0]
+  assert (walking[1:] < walking[0]).all()

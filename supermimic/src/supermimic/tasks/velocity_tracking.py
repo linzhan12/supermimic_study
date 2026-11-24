@@ -59,19 +59,27 @@ def forward_gait_gate(command: torch.Tensor) -> torch.Tensor:
   )
 
 
-def forward_precision_reward(quat, linear_w, angular_w, command):
+def forward_precision_reward(
+  quat, linear_w, angular_w, command, allow_gait_lateral: bool = False
+):
   error = heading_velocity(quat, linear_w, angular_w) - command
   error = error / command.new_tensor((0.13, 0.14, 0.28))
-  return forward_gait_gate(command) / (1 + error.square().sum(-1))
+  gate = forward_gait_gate(command)
+  if allow_gait_lateral:
+    error = torch.stack((error[..., 0], (1 - gate) * error[..., 1], error[..., 2]), dim=-1)
+  return gate / (1 + error.square().sum(-1))
 
 
-def physical_forward_precision_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
+def physical_forward_precision_reward(
+  env: ManagerBasedRlEnv, allow_gait_lateral: bool = False
+) -> torch.Tensor:
   _, quat, linear_w, angular_b = physical_root(env)
   return forward_precision_reward(
     quat,
     linear_w,
     quat_apply(quat, angular_b),
     env.command_manager.get_command("velocity"),
+    allow_gait_lateral,
   )
 
 

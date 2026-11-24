@@ -42,10 +42,10 @@ class VelocityWorldModelEnv(WorldModelEnv):
       if "turn_tracking" in env.cfg.rewards
       else 0.0
     )
-    self.forward_precision_weight = (
-      env.cfg.rewards["forward_precision"].weight
-      if "forward_precision" in env.cfg.rewards
-      else 0.0
+    precision = env.cfg.rewards.get("forward_precision")
+    self.forward_precision_weight = precision.weight if precision is not None else 0.0
+    self.precision_allows_gait_lateral = (
+      precision is not None and precision.params.get("allow_gait_lateral", False)
     )
     self.steering_recovery_weight = (
       env.cfg.rewards["steering_recovery"].weight
@@ -96,7 +96,7 @@ class VelocityWorldModelEnv(WorldModelEnv):
     )
     if self.forward_precision_weight:
       reward = reward + self.forward_precision_weight * forward_precision_reward(
-        quat, linear_w, angular_w, self.command
+        quat, linear_w, angular_w, self.command, self.precision_allows_gait_lateral
       )
     if self.turn_tracking_weight:
       reward = reward + self.turn_tracking_weight * turn_tracking_reward(

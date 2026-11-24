@@ -165,6 +165,10 @@ def main() -> None:
     raise ValueError("Phase-dependent weight transfer requires full-body gait tracking.")
   if args.runner.forward_gait_foot_orientation and not args.runner.forward_gait_weight_transfer:
     raise ValueError("Foot orientation tracking requires the full-body weight-transfer reward.")
+  if args.runner.forward_gait_foot_placement and (
+    not args.runner.forward_gait_foot_orientation or not args.runner.forward_gait_demo_files
+  ):
+    raise ValueError("Foot placement requires foot orientation and physical demonstrations.")
   if steering_recovery_limit and not args.runner.train_steering_recovery and not gait_limit:
     raise ValueError("Freezing steering recovery requires a trainable walking adapter.")
   if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
@@ -179,8 +183,10 @@ def main() -> None:
     raise ValueError("Invalid steering recovery action limit or reward weight.")
   if (steering_recovery_limit or steering_recovery_weight) and not args.runner.independent_velocity:
     raise ValueError("Steering recovery requires the independent velocity task.")
-  if steering_recovery_limit and (teacher_steps or args.runner.actor_obs != "rep_state"):
-    raise ValueError("Steering-only fine tuning requires rep_state and skips the gait teacher.")
+  if steering_recovery_limit and args.runner.actor_obs != "rep_state":
+    raise ValueError("Steering recovery requires rep_state observations.")
+  if steering_recovery_limit and args.runner.train_steering_recovery and teacher_steps:
+    raise ValueError("Steering-only fine tuning skips the gait teacher.")
   if not math.isfinite(posture_weight) or posture_weight < 0:
     raise ValueError("Posture reward weight must be finite and nonnegative.")
   if not 0.0 <= moving_posture_scale <= 1.0:
@@ -262,7 +268,9 @@ def main() -> None:
       args.env.rewards["velocity"].func = physical_gait_velocity_reward
     if precision_weight:
       args.env.rewards["forward_precision"] = RewardTermCfg(
-        func=physical_forward_precision_reward, weight=precision_weight
+        func=physical_forward_precision_reward,
+        weight=precision_weight,
+        params={"allow_gait_lateral": args.runner.forward_gait_weight_transfer},
       )
     if gait_weight:
       if args.runner.forward_gait_full_body:
@@ -271,6 +279,7 @@ def main() -> None:
           func=FullBodyGaitPrior, weight=gait_weight, reference_files=files,
           transfer_style=args.runner.forward_gait_weight_transfer,
           foot_orientation=args.runner.forward_gait_foot_orientation,
+          foot_placement=args.runner.forward_gait_foot_placement,
         )
       else:
         args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)

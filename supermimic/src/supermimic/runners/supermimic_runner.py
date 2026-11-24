@@ -241,6 +241,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Track torso motion and phase-dependent lateral transfer in straight walking."""
   forward_gait_foot_orientation: bool = False
   """Track the demonstrated foot axes relative to the robot's heading."""
+  forward_gait_foot_placement: bool = False
+  """Track demonstrated feet relative to the robot's heading and the ground."""
   forward_foot_cycle_weight: float = 0.0
   """Weight for phase-aligned alternation, clearance and placement of the feet."""
   forward_gait_reflection: float = 0.0
@@ -1104,7 +1106,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if self.cfg.forward_gait_teacher_steps:
         gait = self.env.unwrapped.reward_manager.get_term_cfg("forward_gait").func
         warm_start_gait_adapter(
-          actor, self._representation, gait, self.cfg.forward_gait_teacher_steps
+          actor, self._representation, gait, self.cfg.forward_gait_teacher_steps,
+          self._wm.action_names,
         )
     # 只为占有非零批次比例的任务生成目标；编码器仍按配置的任务顺序分配槽位。
     self._active_task_specs = [
