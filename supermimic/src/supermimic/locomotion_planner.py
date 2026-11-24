@@ -147,6 +147,7 @@ class _Candidate:
   frame: int
   cost: float
   pace_error: float
+  split_start: bool
 
 
 class LocomotionPlanner:
@@ -169,6 +170,8 @@ class LocomotionPlanner:
     stop_double_support_pose: float | None = None,
     start_legs: tuple[int, ...] = (),
     start_upper_blend: float = 0.32,
+    directional_selection: bool = False,
+    direct_steering_start: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -178,6 +181,18 @@ class LocomotionPlanner:
     self.blend_steps = max(3, round(0.16 / dt))
     self.start_legs = start_legs
     self.start_blend_steps = max(self.blend_steps, round(start_upper_blend / dt))
+    self.directional_selection = directional_selection
+    self.direct_steering_start = direct_steering_start
+    self.committed_steps = self.blend_steps
+    self.clip_direction = (
+      {
+        clip.name: self._direction(clip.twist.mean(dim=0) + clip.mean_tracking_bias)
+        for clip in clips
+        if clip.mode == "walk"
+      }
+      if directional_selection
+      else {}
+    )
     self.preview_length = PREVIEW_STEPS + max(
       self.replan_steps + self.blend_steps + 2, prediction_steps
     )
@@ -216,14 +231,8 @@ class LocomotionPlanner:
     moving = bool(command.abs().max() > 0.025)
     source_frame = self.frame + self.offset
     active = self.clip
-    if active is not None:
-      seam = (
-        self.start_blend_steps
-        if active.mode == "start" and self.start_legs
-        else self.blend_steps
-      )
-      if self.offset < seam:
-        return
+    if active is not None and self.offset < self.committed_steps:
+      return
     if active is None and self.mode == "stop":
       if self.offset < len(self.plan.q) - 1:
         return
@@ -247,10 +256,19 @@ class LocomotionPlanner:
       mode: Mode = "start" if self.mode == "stand" else "walk"
     else:
       mode = "stop"
-    candidates = self._candidates(mode, observed_contact)
+    direction = self._direction(command) if self.directional_selection else None
+    direct_start = (
+      self.direct_steering_start
+      and self.mode in ("stand", "stop")
+      and direction not in (None, (0, 0))
+      and bool(observed_contact.all())
+    )
+    if direct_start:
+      mode = "walk"
+    candidates = self._candidates(mode, observed_contact, direction, direct_start)
     if not candidates and mode == "start":
       mode = "walk"
-      candidates = self._candidates(mode, observed_contact)
+      candidates = self._candidates(mode, observed_contact, direction)
     if not candidates:
       self.last_costs = []
       if mode == "stop" and stop_fallback is not None and bool(observed_contact.all()):
@@ -301,14 +319,37 @@ class LocomotionPlanner:
     self.frame = choice.frame
     self.plan = windows[best]
     self.offset = 0
+    self.committed_steps = (
+      self.start_blend_steps if choice.split_start else self.blend_steps
+    )
 
-  def _candidates(self, mode: Mode, observed_contact: torch.Tensor) -> list[_Candidate]:
+  @staticmethod
+  def _direction(command: torch.Tensor) -> tuple[int, int]:
+    side, turn = command[1:].tolist()
+    return (
+      1 if side > 0.1 else -1 if side < -0.1 else 0,
+      1 if turn > 0.16 else -1 if turn < -0.16 else 0,
+    )
+
+  def _candidates(
+    self,
+    mode: Mode,
+    observed_contact: torch.Tensor,
+    direction: tuple[int, int] | None = None,
+    direct_start: bool = False,
+  ) -> list[_Candidate]:
     old = self.plan.hold_after(self.offset, self.blend_steps + 1)
     old_support = old.contact[0] if old.contact[0].any() else observed_contact
     continued = self.frame + self.offset
     choices = []
     for clip in self.clips:
       if clip.mode != mode:
+        continue
+      if (
+        mode == "walk"
+        and direction is not None
+        and self.clip_direction[clip.name] != direction
+      ):
         continue
       frames = clip.frames
       last_entry = len(frames.q) - PREVIEW_STEPS
@@ -352,9 +393,10 @@ class LocomotionPlanner:
       if self.strict_contact:
         # A standing pose can differ in arm posture from the recorded start.
         # Permit that difference when both feet remain in support at the join.
-        double_support_start = (mode == "start") & common.all(-1)
+        starting = mode == "start" or direct_start
+        double_support_start = starting & common.all(-1)
         pose_limit = torch.where(double_support_start, 0.32, 0.26)
-        if mode == "start" and self.start_legs:
+        if starting and self.start_legs:
           supported = double_support_start & observed_contact.all()
           leg_gap = frames.q[indices][:, self.start_legs] - old.q[0, self.start_legs]
           admissible = supported & (leg_gap.square().mean(-1).sqrt() < 0.18)
@@ -374,7 +416,13 @@ class LocomotionPlanner:
       if torch.isfinite(score[index]):
         error = pace_cost.expand_as(score)[index].sqrt().item()
         choices.append(
-          _Candidate(clip, int(indices[index]), float(score[index]), error)
+          _Candidate(
+            clip,
+            int(indices[index]),
+            float(score[index]),
+            error,
+            bool(self.start_legs) and (mode == "start" or direct_start),
+          )
         )
     return choices
 
@@ -398,7 +446,7 @@ class LocomotionPlanner:
     if self._continues(candidate):
       return self.plan.hold_after(self.offset, self.preview_length)
 
-    split_start = candidate.clip.mode == "start" and bool(self.start_legs)
+    split_start = candidate.split_start
     count = (self.start_blend_steps if split_start else self.blend_steps) + 1
     old = self.plan.hold_after(self.offset, count)
     remaining = len(candidate.clip.frames.q) - candidate.frame

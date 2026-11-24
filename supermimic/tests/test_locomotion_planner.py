@@ -144,3 +144,16 @@ def test_start_can_blend_arms_slower_when_measured_leg_support_matches():
   torch.testing.assert_close(preview.q[8, :12], start.q[8, :12])
   torch.testing.assert_close(preview.q[8, 12:], start.q[8, 12:] * 0.5)
   torch.testing.assert_close(preview.q[16], start.q[16])
+
+
+def test_direction_filter_uses_signed_requested_turn():
+  old = window(1)
+  frames = window(90)
+  left_twist = torch.tensor([0.35, 0.0, 0.4]).expand(90, -1)
+  right_twist = torch.tensor([0.35, 0.0, -0.4]).expand(90, -1)
+  left = ReferenceClip("left", "walk", frames, left_twist, torch.zeros(3))
+  right = ReferenceClip("right", "walk", frames, right_twist, torch.zeros(3))
+  planner = LocomotionPlanner([left, right], old, 0.02, directional_selection=True)
+  planner.update(left_twist[0], torch.tensor([True, True]))
+  assert planner.clip is left
+  assert [candidate["clip"] for candidate in planner.last_costs] == ["left"]

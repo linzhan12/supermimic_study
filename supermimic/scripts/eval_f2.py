@@ -96,6 +96,8 @@ class Config:
   contact_stop_duration: float | None = None
   contact_stop_max_foot_speed: float | None = None
   start_upper_blend: float | None = None
+  directional_selection: bool = False
+  direct_steering_start: bool = False
   strict_contact: bool = True
 
 
@@ -221,6 +223,12 @@ def evaluate(cfg: Config) -> None:
   ):
     raise ValueError(
       "Choose a start upper-body blend from 0.16 to 0.6 s with a reference bank."
+    )
+  if cfg.direct_steering_start and (
+    not cfg.directional_selection or cfg.start_upper_blend is None
+  ):
+    raise ValueError(
+      "Direct steering starts require directional selection and a split start seam."
     )
   if (cfg.steady_forward or cfg.extra_forward_speeds) and not cfg.record_posture:
     raise ValueError("The steady forward test requires --record-posture True.")
@@ -443,6 +451,8 @@ def evaluate(cfg: Config) -> None:
         "contact_stop_duration": cfg.contact_stop_duration,
         "contact_stop_max_foot_speed": cfg.contact_stop_max_foot_speed,
         "start_upper_blend": cfg.start_upper_blend,
+        "directional_selection": cfg.directional_selection,
+        "direct_steering_start": cfg.direct_steering_start,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -501,6 +511,8 @@ def evaluate(cfg: Config) -> None:
             stop_double_support_pose=cfg.stop_double_support_pose,
             start_legs=leg_indices if cfg.start_upper_blend is not None else (),
             start_upper_blend=cfg.start_upper_blend or 0.32,
+            directional_selection=cfg.directional_selection,
+            direct_steering_start=cfg.direct_steering_start,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
