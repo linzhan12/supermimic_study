@@ -101,6 +101,7 @@ class Config:
   candidate_entries: int = 1
   start_search_time: float | None = None
   restart_from_rest: bool = False
+  heading_strength: float = 0.0
   strict_contact: bool = True
 
 
@@ -245,6 +246,8 @@ def evaluate(cfg: Config) -> None:
     )
   if cfg.command_cost_weight and not cfg.trackability_weight:
     raise ValueError("Command cost requires world-model ranking.")
+  if not 0.0 <= cfg.heading_strength <= 1.0:
+    raise ValueError("Heading guidance strength must be in [0, 1].")
   if not 1 <= cfg.candidate_entries <= 4:
     raise ValueError("Choose one to four entry phases per reference.")
   if cfg.start_search_time is not None and not 0.0 < cfg.start_search_time <= 1.0:
@@ -466,6 +469,7 @@ def evaluate(cfg: Config) -> None:
         "candidate_entries": cfg.candidate_entries,
         "start_search_time": cfg.start_search_time,
         "restart_from_rest": cfg.restart_from_rest,
+        "heading_strength": cfg.heading_strength,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -567,6 +571,7 @@ def evaluate(cfg: Config) -> None:
               command=target,
               command_weight=cfg.command_cost_weight,
               dt=dt,
+              heading_strength=cfg.heading_strength,
             )
             contact = feet.data.found > 0
             stop_fallback = None
@@ -600,7 +605,13 @@ def evaluate(cfg: Config) -> None:
               observed_twist=measured_twist,
             )
             preview = planner.preview()
-            goal = preview.actor_goal(torch.zeros_like(env_ids), aux)
+            goal = preview.actor_goal(
+              torch.zeros_like(env_ids),
+              aux,
+              yaw_rate=float(target[2]) if cfg.heading_strength else 0.0,
+              heading_strength=cfg.heading_strength,
+              dt=dt,
+            )
           elif route == "motion":
             goal = extract_actor_goal(obs["goal"])
           else:

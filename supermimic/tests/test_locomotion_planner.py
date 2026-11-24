@@ -186,3 +186,17 @@ def test_changed_lateral_command_can_end_compatible_start_after_its_seam():
     planner.advance()
   planner.update(right, support)
   assert planner.clip is walk
+
+
+def test_heading_guide_preserves_joint_goals_and_is_inactive_for_straight_commands():
+  reference = window(PREVIEW_STEPS)
+  aux = torch.cat((reference.p[0], reference.quat[0]))[None]
+  steps = torch.zeros(1, dtype=torch.long)
+  plain = reference.actor_goal(steps, aux)
+  guided = reference.actor_goal(steps, aux, yaw_rate=0.4, heading_strength=0.58)
+  content = NUM_GOAL_FRAMES * 2 * reference.q.shape[1]
+  torch.testing.assert_close(guided[:, :content], plain[:, :content], atol=0, rtol=0)
+  assert not torch.equal(guided[:, content:], plain[:, content:])
+  torch.testing.assert_close(
+    reference.actor_goal(steps, aux, heading_strength=0.58), plain, atol=0, rtol=0
+  )

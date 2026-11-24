@@ -35,6 +35,7 @@ def predict_tracking_cost(
   command: torch.Tensor | None = None,
   command_weight: float = 0.0,
   dt: float = 0.02,
+  heading_strength: float = 0.0,
 ) -> torch.Tensor:
   """Roll out the same motion actor that will execute the proposed reference.
 
@@ -59,10 +60,16 @@ def predict_tracking_cost(
   use_command = command is not None and command_weight > 0.0
   command_start = steps // 3
   twist_sum = state.new_zeros((count, 3))
+  yaw_rate = float(command[2]) if heading_strength and command is not None else 0.0
   for index in range(steps):
     t = torch.tensor([index], device=state.device)
     goals = torch.cat(
-      [window.actor_goal(t, aux[i : i + 1]) for i, window in enumerate(windows)]
+      [
+        window.actor_goal(
+          t, aux[i : i + 1], yaw_rate=yaw_rate, heading_strength=heading_strength, dt=dt
+        )
+        for i, window in enumerate(windows)
+      ]
     )
     action = actor(build_actor_obs_td({"motion": goals}, history))
     previous = aux

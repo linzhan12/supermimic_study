@@ -65,12 +65,36 @@ class ReferenceWindow:
       window.contact,
     )
 
-  def actor_goal(self, steps: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
+  def actor_goal(
+    self,
+    steps: torch.Tensor,
+    aux: torch.Tensor,
+    *,
+    yaw_rate: float = 0.0,
+    heading_strength: float = 0.0,
+    dt: float = 0.02,
+  ) -> torch.Tensor:
     """Use the original 10-frame layout with relative root orientation."""
     offsets = GOAL_FRAME_STRIDE * torch.arange(NUM_GOAL_FRAMES, device=self.q.device)
     index = steps[..., None] + offsets
+    orientation_w = self.quat[index]
+    if heading_strength and abs(yaw_rate) > 0.16:
+      # Guide the heading from the observed root. Tilt and every joint target
+      # stay in the original reference, and the yaw correction is bounded.
+      advance = (offsets * dt + 0.12) * (0.5 * yaw_rate)
+      zero = torch.zeros_like(advance)
+      increment = torch.stack((advance.cos(), zero, zero, advance.sin()), dim=-1)
+      anchor = yaw_quat(aux[:, 3:])[:, None].expand_as(orientation_w)
+      ideal = quat_mul(anchor, increment[None].expand_as(orientation_w))
+      delta = quat_mul(ideal, quat_conjugate(yaw_quat(orientation_w)))
+      angle = 2 * torch.atan2(delta[..., 3], delta[..., 0])
+      bounded = torch.atan2(angle.sin(), angle.cos()).clamp(-0.24, 0.24)
+      half = 0.5 * heading_strength * bounded
+      zero = torch.zeros_like(half)
+      correction = torch.stack((half.cos(), zero, zero, half.sin()), dim=-1)
+      orientation_w = quat_mul(correction, orientation_w)
     _, orientation = assemble_anchor_window(
-      aux[..., :3], aux[..., 3:], self.p[index], self.quat[index]
+      aux[..., :3], aux[..., 3:], self.p[index], orientation_w
     )
     content = torch.cat((self.q[index], self.qd[index]), dim=-1).flatten(start_dim=1)
     return torch.cat((content, orientation), dim=-1)
