@@ -12,6 +12,7 @@ from pathlib import Path
 import mjlab.tasks  # noqa: F401
 import torch
 import tyro
+from f2_prediction_audit import PredictionAudit
 from mjlab.envs import ManagerBasedRlEnv, mdp
 from mjlab.managers import TerminationTermCfg
 from mjlab.rl import RslRlVecEnvWrapper
@@ -90,6 +91,7 @@ class Config:
   cases: tuple[str, ...] = ()
   trackability_weight: float = 0.0
   prediction_steps: int = 10
+  prediction_audit_stride: int = 0
   pace_margin: float | None = None
   stop_double_support_pose: float | None = None
   contact_stop_duration: float | None = None
@@ -243,6 +245,12 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("--motion-frames requires --motion-only.")
   if cfg.reference_bank is None and (cfg.planned_only or cfg.trackability_weight != 0):
     raise ValueError("Planned evaluation requires --reference-bank.")
+  if cfg.prediction_audit_stride < 0 or (
+    cfg.prediction_audit_stride and cfg.reference_bank is None
+  ):
+    raise ValueError(
+      "The prediction audit requires a reference bank and a positive stride."
+    )
   if cfg.motion_only and cfg.reference_bank is not None:
     raise ValueError("Fixed-reference and planned evaluations are separate modes.")
   if not math.isfinite(cfg.trackability_weight) or cfg.trackability_weight < 0:
@@ -417,7 +425,7 @@ def evaluate(cfg: Config) -> None:
       if not clips:
         raise ValueError(f"No reference clips under {cfg.reference_bank}.")
     dynamics_path = cfg.checkpoint_dir / "world_model.pt"
-    if cfg.trackability_weight:
+    if cfg.trackability_weight or cfg.prediction_audit_stride:
       wm.load_bundle(
         torch.load(dynamics_path, map_location=cfg.device, weights_only=True)
       )
@@ -519,9 +527,11 @@ def evaluate(cfg: Config) -> None:
         "contact_launch_forward_lead": cfg.contact_launch_forward_lead,
         "rank_contact_launch": cfg.rank_contact_launch,
         "world_model_sha256": sha256(dynamics_path)
-        if cfg.trackability_weight
+        if cfg.trackability_weight or cfg.prediction_audit_stride
         else None,
       }
+      if cfg.prediction_audit_stride:
+        summary["planning"]["prediction_audit_stride"] = cfg.prediction_audit_stride
     for case, (frame, schedule) in scenarios.items():
       initial = None
       case_summary = {"reference_frame": frame, "routes": {}}
@@ -555,6 +565,7 @@ def evaluate(cfg: Config) -> None:
         history = None
         trace = []
         planner = None
+        audit = None
         if route == "planned":
           assert feet.data.found is not None
           initial_window = ReferenceWindow(
@@ -586,6 +597,10 @@ def evaluate(cfg: Config) -> None:
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
+          if cfg.prediction_audit_stride:
+            audit = PredictionAudit(
+              cfg.prediction_audit_stride, dt, cfg.heading_strength
+            )
         for step, (phase, scripted_target) in enumerate(schedule):
           ref_frame = int(motion_cmd.time_steps[0])
           if route in ("scripted_velocity", "planned"):
@@ -693,7 +708,25 @@ def evaluate(cfg: Config) -> None:
           reference_q = motion_cmd.motion.joint_pos[ref_frame]
           actor_obs = build_actor_obs_td({task: goal}, history)
           action = actor(actor_obs)
+          if audit is not None:
+            before_aux = aux.clone()
           obs, reward, terminated, truncated, _ = sim_env.step(action)
+          if audit is not None and not (terminated | truncated)[0].item():
+            assert planner is not None
+            audit.record(
+              planner,
+              phase,
+              state,
+              before_aux,
+              history,
+              goal,
+              action,
+              target,
+              contact,
+              wm.representation.represent(obs["full_state"]),
+              wm.representation.extract_aux_state(obs["full_state"]),
+              feet.data.found > 0,
+            )
           actual = heading_twist(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w
           )
@@ -773,6 +806,8 @@ def evaluate(cfg: Config) -> None:
         with (cfg.output_dir / f"{case}_{route}.jsonl").open("w") as stream:
           for row in trace:
             stream.write(json.dumps(row, allow_nan=False) + "\n")
+        if audit is not None:
+          audit.write(cfg.output_dir / f"{case}_prediction.jsonl", wm, actor, sim_ctx)
         result = summarize(trace, len(schedule), dt)
         if case.startswith("steady_forward") and result["completed"]:
           result["arm_swing"] = arm_swing_metrics(

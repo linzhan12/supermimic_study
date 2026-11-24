@@ -1,5 +1,8 @@
 """Evaluate proposed references through a frozen SuperMimic world model."""
 
+from collections.abc import Iterator
+from itertools import chain
+
 import torch
 from mjlab.utils.lab_api.math import quat_conjugate, quat_mul, yaw_quat
 
@@ -18,6 +21,51 @@ def projected_twist(
   angular = torch.zeros_like(linear)
   angular[:, 2] = torch.atan2(radians.sin(), radians.cos()) / dt
   return heading_twist(previous[:, 3:], linear, angular)
+
+
+def tracking_steps(
+  windows: list[ReferenceWindow],
+  actor: MultiEncoderAE,
+  dynamics: Dynamics,
+  representation: StateRepresentation,
+  state: torch.Tensor,
+  aux: torch.Tensor,
+  history: torch.Tensor,
+  context: torch.Tensor,
+  steps: int,
+  *,
+  dt: float,
+  yaw_rate: float,
+  heading_strength: float,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+  """Yield predicted root poses, joint states and actions in control order."""
+  count = len(windows)
+  if (
+    not windows or not 1 <= steps <= min(len(w.q) for w in windows) - PREVIEW_STEPS + 1
+  ):
+    raise ValueError("The world-model rollout must fit every reference preview.")
+  state = state.expand(count, -1)
+  aux = aux.expand(count, -1)
+  history = history.expand(count, -1, -1)
+  context = context.expand(count, -1)
+  for index in range(steps):
+    t = torch.tensor([index], device=state.device)
+    goals = torch.cat(
+      [
+        window.actor_goal(
+          t, aux[i : i + 1], yaw_rate=yaw_rate, heading_strength=heading_strength, dt=dt
+        )
+        for i, window in enumerate(windows)
+      ]
+    )
+    action = actor(build_actor_obs_td({"motion": goals}, history))
+    aux, state = dynamics(state, action, aux, context)
+    joints = representation.joint_state(state)
+    yield aux, joints, action
+    sensor = representation.compute_actor_sensor(
+      state, context, aux_state=aux, joint_state=joints, last_action=action
+    )
+    history = torch.cat((history[:, 1:], sensor.unsqueeze(1)), dim=1)
 
 
 @torch.no_grad()
@@ -44,14 +92,23 @@ def predict_tracking_cost(
   positions to the matching next reference frame, including pelvis displacement.
   """
   count = len(windows)
-  if (
-    not windows or not 1 <= steps <= min(len(w.q) for w in windows) - PREVIEW_STEPS + 1
-  ):
-    raise ValueError("The world-model rollout must fit every reference preview.")
-  state = state.expand(count, -1)
-  aux = aux.expand(count, -1)
-  history = history.expand(count, -1, -1)
-  context = context.expand(count, -1)
+  yaw_rate = float(command[2]) if heading_strength and command is not None else 0.0
+  rollout = tracking_steps(
+    windows,
+    actor,
+    dynamics,
+    representation,
+    state,
+    aux,
+    history,
+    context,
+    steps,
+    dt=dt,
+    yaw_rate=yaw_rate,
+    heading_strength=heading_strength,
+  )
+  # The generator checks for a complete preview before the first model step.
+  first = next(rollout)
   joint_targets = torch.stack([w.q[1 : steps + 1] for w in windows])
   root_targets = torch.stack([w.p[1 : steps + 1] for w in windows])
   origin = torch.stack([w.p[0] for w in windows])
@@ -60,23 +117,11 @@ def predict_tracking_cost(
   use_command = command is not None and command_weight > 0.0
   command_start = steps // 3
   twist_sum = state.new_zeros((count, 3))
-  yaw_rate = float(command[2]) if heading_strength and command is not None else 0.0
-  for index in range(steps):
-    t = torch.tensor([index], device=state.device)
-    goals = torch.cat(
-      [
-        window.actor_goal(
-          t, aux[i : i + 1], yaw_rate=yaw_rate, heading_strength=heading_strength, dt=dt
-        )
-        for i, window in enumerate(windows)
-      ]
-    )
-    action = actor(build_actor_obs_td({"motion": goals}, history))
-    previous = aux
-    aux, state = dynamics(state, action, aux, context)
+  previous = aux.expand(count, -1)
+  for index, (aux, joints, _) in enumerate(chain((first,), rollout)):
     if use_command and index >= command_start:
       twist_sum += projected_twist(previous, aux, dt)
-    joints = representation.joint_state(state)
+    previous = aux
     q = joints[..., : joint_targets.shape[-1]]
     q_error = ((q - joint_targets[:, index]) / 0.25).square().mean(-1)
     expected_xy = root_targets[:, index, :2] - origin[:, :2]
@@ -86,10 +131,6 @@ def predict_tracking_cost(
     # independent of yaw and of which quaternion hemisphere is used.
     tilt = (2 * aux[:, 4:6].norm(dim=-1) - 0.35).clamp_min(0).square()
     cost += q_error + 0.5 * planar + 0.5 * height + 8 * tilt
-    sensor = representation.compute_actor_sensor(
-      state, context, aux_state=aux, joint_state=joints, last_action=action
-    )
-    history = torch.cat((history[:, 1:], sensor.unsqueeze(1)), dim=1)
   cost = cost / steps
   if use_command:
     assert command is not None
