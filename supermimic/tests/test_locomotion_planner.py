@@ -102,3 +102,27 @@ def test_trackability_ranking_does_not_select_an_incompatible_pace():
   planner.update(target, torch.tensor([True, True]))
   assert planner.clip is medium
   assert [candidate["clip"] for candidate in planner.last_costs] == ["medium"]
+
+
+def test_recovery_waits_for_two_measured_support_feet_and_finishes_its_plan():
+  initial = window(1)
+  moving = window(120)
+  twist = moving.q.new_zeros((120, 3))
+  walk = ReferenceClip("walk", "walk", moving, twist, torch.zeros(3))
+  planner = LocomotionPlanner([walk], initial, 0.02)
+  planner.mode = "walk"
+  stopped = window(21, 0.15)
+  command = torch.zeros(3)
+  planner.update(command, torch.tensor([True, False]), stop_fallback=lambda: stopped)
+  assert planner.mode == "walk"
+
+  support = torch.tensor([True, True])
+  planner.update(command, support, stop_fallback=lambda: stopped)
+  assert planner.mode == "stop"
+  for _ in stopped.q[1:]:
+    planner.advance()
+    planner.update(command, support, stop_fallback=lambda: stopped)
+
+  assert planner.mode == "stand"
+  assert planner.plan is stopped
+  assert not planner.preview().qd.any()

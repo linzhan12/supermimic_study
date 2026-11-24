@@ -200,6 +200,8 @@ class LocomotionPlanner:
     command: torch.Tensor,
     observed_contact: torch.Tensor,
     score_prediction: Callable[[list[ReferenceWindow]], torch.Tensor] | None = None,
+    *,
+    stop_fallback: Callable[[], ReferenceWindow | None] | None = None,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -212,6 +214,10 @@ class LocomotionPlanner:
     active = self.clip
     if active is not None and self.offset < self.blend_steps:
       return
+    if active is None and self.mode == "stop":
+      if self.offset < len(self.plan.q) - 1:
+        return
+      self.mode = "stand"
     if not moving and self.mode == "stand":
       return
     # A start or stop has a task-relevant contact sequence. Finish it unless
@@ -237,6 +243,13 @@ class LocomotionPlanner:
       candidates = self._candidates(mode, observed_contact)
     if not candidates:
       self.last_costs = []
+      if mode == "stop" and stop_fallback is not None and bool(observed_contact.all()):
+        recovery = stop_fallback()
+        if recovery is not None:
+          self.plan = recovery
+          self.mode = "stop"
+          self.clip = None
+          self.frame = self.offset = 0
       return
     if mode == "walk" and self.pace_margin is not None:
       smallest = min(candidate.pace_error for candidate in candidates)

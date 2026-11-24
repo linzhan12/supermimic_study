@@ -36,6 +36,7 @@ from supermimic.runners.supermimic_runner import (
   build_actor,
   build_world_model,
 )
+from supermimic.stance_bridge import StanceBridge
 from supermimic.tasks.task_spec import VelocityTaskCfg, build_actor_obs_td
 
 STAND_START = (
@@ -92,6 +93,8 @@ class Config:
   prediction_steps: int = 10
   pace_margin: float | None = None
   stop_double_support_pose: float | None = None
+  contact_stop_duration: float | None = None
+  contact_stop_max_foot_speed: float | None = None
   strict_contact: bool = True
 
 
@@ -198,6 +201,20 @@ def summarize(trace: list[dict], planned_steps: int, dt: float) -> dict:
 def evaluate(cfg: Config) -> None:
   if cfg.seed < 0:
     raise ValueError("Use a nonnegative seed for paired replay.")
+  if cfg.contact_stop_duration is not None and (
+    cfg.reference_bank is None
+    or not math.isfinite(cfg.contact_stop_duration)
+    or cfg.contact_stop_duration < 0.16
+  ):
+    raise ValueError("Contact stopping requires a reference bank and at least 0.16 s.")
+  if cfg.contact_stop_max_foot_speed is not None and (
+    cfg.contact_stop_duration is None
+    or not math.isfinite(cfg.contact_stop_max_foot_speed)
+    or cfg.contact_stop_max_foot_speed <= 0.0
+  ):
+    raise ValueError(
+      "The contact stop foot speed requires a stop duration and a positive limit."
+    )
   if (cfg.steady_forward or cfg.extra_forward_speeds) and not cfg.record_posture:
     raise ValueError("The steady forward test requires --record-posture True.")
   if cfg.motion_frames and not cfg.motion_only:
@@ -306,6 +323,23 @@ def evaluate(cfg: Config) -> None:
       torso = robot.body_names.index("torso_link")
       q_stand = data.default_joint_pos[0].clone()
     dt = sim_env.step_dt
+    stance_bridge = None
+    if cfg.contact_stop_duration is not None:
+      leg_indices = [
+        i
+        for i, name in enumerate(robot.joint_names)
+        if any(part in name for part in ("_hip_", "_knee_", "_ankle_"))
+      ]
+      stance_bridge = StanceBridge(
+        sim_env.sim.mj_model,
+        robot.indexing.free_joint_q_adr,
+        robot.indexing.joint_q_adr,
+        leg_indices,
+        robot.indexing.site_ids[foot_sites],
+        q_stand,
+        dt,
+        cfg.contact_stop_duration,
+      )
     clips = []
     if cfg.reference_bank is not None:
       clips = [
@@ -399,6 +433,8 @@ def evaluate(cfg: Config) -> None:
         "prediction_steps": cfg.prediction_steps,
         "pace_margin": cfg.pace_margin,
         "stop_double_support_pose": cfg.stop_double_support_pose,
+        "contact_stop_duration": cfg.contact_stop_duration,
+        "contact_stop_max_foot_speed": cfg.contact_stop_max_foot_speed,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -491,7 +527,22 @@ def evaluate(cfg: Config) -> None:
               context=sim_ctx,
               steps=cfg.prediction_steps,
             )
-            planner.update(target, feet.data.found[0] > 0, score)
+            contact = feet.data.found > 0
+            stop_fallback = None
+            if stance_bridge is not None:
+              measured = ReferenceWindow(
+                data.joint_pos,
+                data.joint_vel,
+                data.root_link_pos_w,
+                data.root_link_quat_w,
+                data.site_pos_w[:, foot_sites],
+                contact,
+              )
+              foot_speed = data.site_lin_vel_w[0, foot_sites, :2].norm(dim=-1)
+              stop_fallback = partial(
+                stance_bridge, measured, foot_speed, cfg.contact_stop_max_foot_speed
+              )
+            planner.update(target, contact[0], score, stop_fallback=stop_fallback)
             preview = planner.preview()
             goal = preview.actor_goal(torch.zeros_like(env_ids), aux)
           elif route == "motion":
