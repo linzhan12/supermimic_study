@@ -249,6 +249,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Extra weight for matching the demonstrated shoulders and elbows."""
   forward_gait_arm_demo_files: str | None = None
   """Optional comma-separated source for the phase-aligned arm targets."""
+  forward_gait_fast_stance_weight: float = 0.0
+  """Extra weight for fast-walking knee and foot heading targets during support."""
   forward_foot_cycle_weight: float = 0.0
   """Weight for phase-aligned alternation, clearance and placement of the feet."""
   forward_gait_reflection: float = 0.0

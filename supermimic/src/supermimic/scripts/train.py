@@ -181,6 +181,11 @@ def main() -> None:
   arm_demos = tuple(os.path.expanduser(path.strip()) for path in arm_demo_paths if path.strip())
   if arm_demos and not gait_arm_weight:
     raise ValueError("Separate arm demonstrations require a nonzero gait arm weight.")
+  stance_weight = args.runner.forward_gait_fast_stance_weight
+  if not math.isfinite(stance_weight) or stance_weight < 0 or (
+    stance_weight and not args.runner.forward_gait_foot_placement
+  ):
+    raise ValueError("Fast stance tracking requires physical foot placement and a nonnegative weight.")
   if steering_recovery_limit and not args.runner.train_steering_recovery and not gait_limit:
     raise ValueError("Freezing steering recovery requires a trainable walking adapter.")
   if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
@@ -295,6 +300,7 @@ def main() -> None:
           reset_fraction=demo_reset,
           arm_weight=gait_arm_weight,
           arm_reference_files=arm_demos,
+          fast_stance_weight=stance_weight,
         )
       else:
         args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)

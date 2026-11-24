@@ -219,6 +219,7 @@ class FullBodyGaitRewardCfg(RewardTermCfg):
   reset_fraction: float = 0.0
   arm_weight: float = 0.0
   arm_reference_files: tuple[str, ...] = ()
+  fast_stance_weight: float = 0.0
 
 
 class FullBodyGaitPrior(ForwardGaitPrior):
@@ -336,12 +337,41 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       self.transfer_widths = q.new_tensor(
         (0.023, 0.13, 0.15, 0.20, 0.070, 0.13, 0.075, 0.075)
       )
+    self.fast_stance_weight = (
+      cfg.fast_stance_weight if isinstance(cfg, FullBodyGaitRewardCfg) else 0.0
+    )
+    if self.fast_stance_weight:
+      self._prepare_stance_samples(names, q)
     if isinstance(cfg, FullBodyGaitRewardCfg) and cfg.reset_fraction:
       reset = env.command_manager.get_term("motion")
       assert isinstance(reset, ReferenceResetCommand)
       self.reset_command = reset
       self.reset_fraction = cfg.reset_fraction
       self.command_term.gait_reset = self._reset_from_demonstration
+
+  def _prepare_stance_samples(self, names: tuple[str, ...], q: torch.Tensor) -> None:
+    contacts = []
+    ends = self.reference_motion.motion_ends.tolist()
+    for path, begin, end in zip(self.reference_files, [0, *ends[:-1]], ends, strict=True):
+      with np.load(path, allow_pickle=False) as demo:
+        if "foot_contact_lr" not in demo:
+          raise ValueError(f"{path}: repack the physical rollout to include foot contacts.")
+        contact = demo["foot_contact_lr"]
+        if contact.dtype != np.bool_ or contact.shape != (end - begin, 2):
+          raise ValueError(f"{path}: invalid left/right foot contacts.")
+        contacts.append(contact)
+    contact = q.new_tensor(np.concatenate(contacts))[self.reference_rows]
+    self.stance_contacts = torch.cat((contact, contact.flip(-1)))
+    self.stance_knees = (names.index("left_knee_joint"), names.index("right_knee_joint"))
+    values = self._stance_values(
+      self.body_samples[:, : q.shape[-1]], self.body_samples[:, 2 * q.shape[-1] :]
+    )
+    self.stance_moments = (values * self.stance_contacts[..., None]).flatten(1)
+
+  def _stance_values(self, q: torch.Tensor, transfer: torch.Tensor) -> torch.Tensor:
+    foot_start = len(self.transfer_widths)
+    lateral_axis = transfer[:, foot_start : foot_start + 4 : 2]
+    return torch.stack((q[:, self.stance_knees], lateral_axis), dim=-1)
 
   def _reset_from_demonstration(self, env_ids: torch.Tensor) -> None:
     command = self.command_term.command[env_ids]
@@ -433,7 +463,8 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     if self.arm_indices:
       arm_error = pose_error[:, self.arm_indices] + 0.25 * rate_error[:, self.arm_indices]
       joint_error = joint_error + self.arm_weight * arm_error.mean(-1)
-    difference = self._transfer(height, quat, linear_w, q) - reference_transfer
+    transfer = self._transfer(height, quat, linear_w, q)
+    difference = transfer - reference_transfer
     n_transfer = len(self.transfer_widths)
     transfer_error = (
       (difference[:, :n_transfer] / self.transfer_widths).square().mean(-1)
@@ -448,7 +479,16 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       placement_widths = difference.new_tensor((0.07, 0.05, 0.025) * 2)
       placement_error = (difference[:, -6:] / placement_widths).square().mean(-1)
       transfer_error = transfer_error + 1.3 * placement_error
-    return forward_gait_gate(command) / (1 + joint_error + 0.42 * transfer_error)
+    denominator = 1 + joint_error + 0.42 * transfer_error
+    if self.fast_stance_weight:
+      contact = weights @ self.stance_contacts
+      support = contact[..., None].clamp_min(1e-5)
+      target = (weights @ self.stance_moments).reshape(-1, 2, 2) / support
+      stance_error = (self._stance_values(q, transfer) - target) / q.new_tensor((0.12, 0.09))
+      fast = ((command[:, 0] - 0.35) / 0.15).clamp(0, 1)
+      error = (contact[..., None] * stance_error.square()).mean((1, 2))
+      denominator = denominator + self.fast_stance_weight * fast * error
+    return forward_gait_gate(command) / denominator
 
 
 class ForwardGaitAdapter(nn.Module):
