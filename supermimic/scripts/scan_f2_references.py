@@ -130,6 +130,18 @@ def nominate(
       [rolling_mean(axis, boundary)[index + frames - boundary] for axis in twist.T],
       axis=1,
     )
+    for label, side in (("walk_left", 0.20), ("walk_right", -0.20)):
+      error = np.stack(
+        ((mean_forward - 0.25) / 0.10, (mean_left - side) / 0.09, mean_yaw / 0.24),
+        axis=1,
+      )
+      scores[label] = (
+        pose_cost
+        + arm_cost
+        + np.linalg.norm(error, axis=1)
+        + 0.60 * low_pace
+        + 0.35 * (touchdown_counts.min(axis=1) < 2)
+      )
     rest_speed = np.sqrt(speed**2 + lateral**2 + (0.15 * angular) ** 2)
     rest = rolling_mean(rest_speed, boundary)[index]
     for label, goal in (
