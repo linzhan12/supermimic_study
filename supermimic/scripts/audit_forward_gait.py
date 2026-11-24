@@ -55,11 +55,25 @@ def foot_geometry(
   return sites, soles, forward
 
 
+def bridge_single_ground_dropout(contact: np.ndarray, soles: np.ndarray) -> np.ndarray:
+  """Bridge a one-frame dropout only if the collision sole is within 2 mm of flat ground."""
+  result = contact.copy()
+  result[1:-1] |= contact[:-2] & contact[2:] & (np.abs(soles[1:-1]) <= 0.002)
+  return result
+
+
 def metrics(
-  model: mujoco.MjModel, rows: list[dict], names: list[str], dt: float
+  model: mujoco.MjModel,
+  rows: list[dict],
+  names: list[str],
+  dt: float,
+  *,
+  bridge_ground_contact: bool = False,
 ) -> dict:
   sites, soles, foot_forward = foot_geometry(model, rows, names)
   contact = np.asarray([r["foot_contact"] for r in rows], dtype=bool)
+  if bridge_ground_contact:
+    contact = bridge_single_ground_dropout(contact, soles)
   speed = np.asarray([r["actual_velocity"] for r in rows])
   foot_speed = np.asarray([r["posture"]["foot_speed_mps"] for r in rows])
   q = np.asarray([r["posture"]["joint_pos_rad"] for r in rows])
@@ -247,6 +261,10 @@ def main() -> None:
     help="Compare the zero-based row interval [FIRST_ROW, END_ROW) in each P0 trace.",
   )
   parser.add_argument("--replay-gif", type=Path, help="Render paired side and front views.")
+  parser.add_argument(
+    "--bridge-ground-contact", action="store_true",
+    help="Diagnose one-frame foot contact dropouts near the flat ground plane.",
+  )
   args = parser.parse_args()
   if args.replay_gif and args.replay_gif.suffix.lower() != ".gif":
     parser.error("The replay output must use the .gif extension.")
@@ -266,7 +284,9 @@ def main() -> None:
       parser.error(f"{label}: duplicate label or incomplete trace window.")
     names = summary["joint_position_order"]
     dt = rows[1]["state_time_s"] - rows[0]["state_time_s"]
-    result[label] = metrics(model, rows, names, dt)
+    result[label] = metrics(
+      model, rows, names, dt, bridge_ground_contact=args.bridge_ground_contact
+    )
     if args.replay_gif:
       traces.append((label, rows, names))
       frame_intervals.append(dt)
