@@ -66,3 +66,24 @@ def test_reference_hold_does_not_keep_a_stale_joint_velocity():
   held = old.hold_after(0, PREVIEW_STEPS)
   torch.testing.assert_close(held.qd[0], old.qd[0])
   assert not held.qd[1:].any()
+
+
+def test_replanning_does_not_blend_an_unchanged_reference_again():
+  old = window(1)
+  motion = window(120, 0.10)
+  motion.q[:, 0] = 0.10 + torch.arange(120) * 0.004
+  motion.qd[:, 0] = 0.20
+  twist = motion.q.new_zeros((120, 3))
+  twist[:, 0] = 0.22
+  clip = ReferenceClip("walk", "walk", motion, twist, torch.zeros(3))
+  planner = LocomotionPlanner([clip], old, 0.02)
+  target = torch.tensor([0.22, 0.0, 0.0])
+  support = torch.tensor([True, True])
+  planner.update(target, support)
+  planned = planner.plan
+  for _ in range(2 * planner.replan_steps):
+    planner.advance()
+    planner.update(target, support)
+  assert planner.plan is planned
+  assert planner.offset == 2 * planner.replan_steps
+  torch.testing.assert_close(planner.preview().q[0], motion.q[planner.offset])

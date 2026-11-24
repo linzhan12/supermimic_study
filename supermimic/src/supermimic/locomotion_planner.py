@@ -205,6 +205,8 @@ class LocomotionPlanner:
     moving = bool(command.abs().max() > 0.025)
     source_frame = self.frame + self.offset
     active = self.clip
+    if active is not None and self.offset < self.blend_steps:
+      return
     if not moving and self.mode == "stand":
       return
     # A start or stop has a task-relevant contact sequence. Finish it unless
@@ -253,6 +255,10 @@ class LocomotionPlanner:
       for i, (candidate, extra) in enumerate(zip(candidates, prediction, strict=True))
     ]
     choice = candidates[best]
+    if self._continues(choice):
+      # This trajectory already contains the next source samples in the
+      # same world frame. Restarting the blend would change the phase.
+      return
     self.clip = choice.clip
     self.mode = choice.clip.mode
     self.frame = choice.frame
@@ -329,10 +335,19 @@ class LocomotionPlanner:
     orientation = yaw_quat(quat)[:, None, :].expand(-1, 2, -1)
     return quat_apply_inverse(orientation, feet - p[:, None, :])
 
+  def _continues(self, candidate: _Candidate) -> bool:
+    return candidate.clip is self.clip and candidate.frame == self.frame + self.offset
+
   def _join(self, candidate: _Candidate) -> ReferenceWindow:
+    if self._continues(candidate):
+      return self.plan.hold_after(self.offset, self.preview_length)
+
     count = self.blend_steps + 1
     old = self.plan.hold_after(self.offset, count)
-    new = candidate.clip.frames.hold_after(candidate.frame, self.preview_length)
+    remaining = len(candidate.clip.frames.q) - candidate.frame
+    new = candidate.clip.frames.hold_after(
+      candidate.frame, max(remaining, self.preview_length)
+    )
     yaw_delta = quat_mul(yaw_quat(old.quat[:1]), quat_conjugate(yaw_quat(new.quat[:1])))
     rotation = yaw_delta.expand(len(new.q), -1)
     new_p = quat_apply(rotation, new.p)
