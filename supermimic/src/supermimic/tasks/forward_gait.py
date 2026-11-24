@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 import torch
 from mjlab.managers import RewardTermCfg
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.forward_kinematics import ForwardKinematics
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, yaw_quat
 from torch import nn
 
 from supermimic.models import build_mlp
@@ -208,6 +209,8 @@ def sagittal_joint_mapping(
 @dataclass(kw_only=True)
 class FullBodyGaitRewardCfg(RewardTermCfg):
   reference_files: tuple[str, ...] = ()
+  transfer_style: bool = False
+  foot_orientation: bool = False
 
 
 class FullBodyGaitPrior(ForwardGaitPrior):
@@ -223,9 +226,32 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     qd = motion.joint_vel[rows]
     permutation, sign = sagittal_joint_mapping(names, q)
     quat = motion.root_quat_w[rows]
+    self.style_fk = None
+    self.track_feet = isinstance(cfg, FullBodyGaitRewardCfg) and cfg.foot_orientation
+    if isinstance(cfg, FullBodyGaitRewardCfg) and cfg.transfer_style:
+      robot = env.scene["robot"]
+      bodies = ("torso_link",)
+      if self.track_feet:
+        bodies += ("left_ankle_roll_link", "right_ankle_roll_link")
+      body_indices = torch.tensor([robot.body_names.index(name) for name in bodies])
+      self.style_fk = ForwardKinematics(
+        env.sim.mj_model,
+        robot.indexing.body_ids,
+        robot.indexing.joint_q_adr,
+        body_indices,
+        device=env.device,
+      )
     transfer = self._transfer(
-      motion.root_pos_w[rows, 2], quat, motion.root_lin_vel_w[rows]
+      motion.root_pos_w[rows, 2], quat, motion.root_lin_vel_w[rows], q
     )
+    transfer_sign = (1, 1, -1, 1, -1, 1)
+    if self.style_fk is not None:
+      transfer_sign += (1, -1)
+    split = len(transfer_sign)
+    mirrored_transfer = transfer[:, :split] * q.new_tensor(transfer_sign)
+    if self.track_feet:
+      feet = transfer[:, split:].reshape(-1, 2, 2).flip(1) * q.new_tensor((-1, 1))
+      mirrored_transfer = torch.cat((mirrored_transfer, feet.flatten(1)), dim=-1)
     self.body_samples = torch.cat(
       (
         torch.cat((q, qd, transfer), dim=-1),
@@ -233,7 +259,7 @@ class FullBodyGaitPrior(ForwardGaitPrior):
           (
             q[:, permutation] * sign,
             qd[:, permutation] * sign,
-            transfer * q.new_tensor((1, 1, -1, 1, -1, 1)),
+            mirrored_transfer,
           ),
           dim=-1,
         ),
@@ -254,14 +280,36 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     )
     self.rate_widths = 12 * self.pose_widths
     self.transfer_widths = q.new_tensor((0.023, 0.13, 0.15, 0.20, 0.10, 0.13))
+    if self.style_fk is not None:
+      self.transfer_widths = q.new_tensor(
+        (0.023, 0.13, 0.15, 0.20, 0.070, 0.13, 0.075, 0.075)
+      )
 
-  @staticmethod
   def _transfer(
-    height: torch.Tensor, quat: torch.Tensor, linear_w: torch.Tensor
+    self,
+    height: torch.Tensor,
+    quat: torch.Tensor,
+    linear_w: torch.Tensor,
+    q: torch.Tensor,
   ) -> torch.Tensor:
-    heading = heading_velocity(quat, linear_w, torch.zeros_like(linear_w))
-    up = quat_apply_inverse(quat, quat.new_tensor((0.0, 0.0, 1.0)).expand_as(linear_w))
-    return torch.cat((height[:, None], up, heading[:, 1:2], linear_w[:, 2:3]), dim=-1)
+    zeros = torch.zeros_like(linear_w)
+    heading = heading_velocity(quat, linear_w, zeros)
+    world_up = quat.new_tensor((0.0, 0.0, 1.0)).expand_as(linear_w)
+    up = quat_apply_inverse(quat, world_up)
+    features = (height[:, None], up, heading[:, 1:2], linear_w[:, 2:3])
+    if self.style_fk is not None:
+      _, orientation, _, _ = self.style_fk(
+        zeros, quat, q, zeros, zeros, torch.zeros_like(q)
+      )
+      torso_up = quat_apply_inverse(orientation[:, 0], world_up)
+      features += (torso_up[:, :2],)
+      if self.track_feet:
+        foot_axis = quat.new_tensor((1.0, 0.0, 0.0)).expand(len(height), 2, 3)
+        forward_w = quat_apply(orientation[:, 1:], foot_axis)
+        heading_quat = yaw_quat(quat)[:, None].expand(-1, 2, -1)
+        forward_heading = quat_apply_inverse(heading_quat, forward_w)
+        features += (forward_heading[..., 1:].flatten(1),)
+    return torch.cat(features, dim=-1)
 
   def score(
     self,
@@ -284,18 +332,19 @@ class FullBodyGaitPrior(ForwardGaitPrior):
     # Choose the target from speed and cycle phase only. The policy cannot pick an easier pose.
     weights = torch.softmax(22 * similarity - 0.5 * speed_error.square(), dim=-1)
     reference_q, reference_qd, reference_transfer = (weights @ self.body_samples).split(
-      (q.shape[-1], qd.shape[-1], 6), dim=-1
+      (q.shape[-1], qd.shape[-1], self.body_samples.shape[-1] - 2 * q.shape[-1]), dim=-1
     )
     q_error = ((q - reference_q) / self.pose_widths).square().mean(-1)
     qd_error = ((qd - reference_qd) / self.rate_widths).square().mean(-1)
+    difference = self._transfer(height, quat, linear_w, q) - reference_transfer
+    n_transfer = len(self.transfer_widths)
     transfer_error = (
-      (
-        (self._transfer(height, quat, linear_w) - reference_transfer)
-        / self.transfer_widths
-      )
-      .square()
-      .mean(-1)
+      (difference[:, :n_transfer] / self.transfer_widths).square().mean(-1)
     )
+    if self.track_feet:
+      foot_widths = difference.new_tensor((0.13, 0.20, 0.13, 0.20))
+      foot_error = (difference[:, n_transfer:] / foot_widths).square().mean(-1)
+      transfer_error = transfer_error + 0.8 * foot_error
     return forward_gait_gate(command) / (
       1 + 0.60 * q_error + 0.17 * qd_error + 0.42 * transfer_error
     )

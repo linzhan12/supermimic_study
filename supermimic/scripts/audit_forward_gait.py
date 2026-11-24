@@ -12,10 +12,10 @@ from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 SIDES = ("left", "right")
 
 
-def foot_positions(
+def foot_geometry(
   model: mujoco.MjModel, rows: list[dict], joint_names: list[str]
-) -> tuple[np.ndarray, np.ndarray]:
-  """Return foot sites and lowest points of the foot collision capsules in metres."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """Return foot sites, lowest collision points, and world-frame forward axes."""
   foot_geoms = [
     [
       i
@@ -36,12 +36,14 @@ def foot_positions(
   data = mujoco.MjData(model)
   sites = np.empty((len(rows), 2, 3))
   soles = np.empty((len(rows), 2))
+  forward = np.empty_like(sites)
   for i, row in enumerate(rows):
     data.qpos[root : root + 3] = row["pelvis_position_w_m"]
     data.qpos[root + 3 : root + 7] = row["pelvis_quaternion_wxyz"]
     data.qpos[qpos_ids] = row["posture"]["joint_pos_rad"]
     mujoco.mj_kinematics(model, data)
     sites[i] = data.site_xpos[site_ids]
+    forward[i] = data.site_xmat[site_ids].reshape(2, 3, 3)[:, :, 0]
     for side, ids in enumerate(foot_geoms):
       # Capsule local z follows the line between its two spherical cap centers.
       axis_z = data.geom_xmat[ids, 8]
@@ -49,13 +51,13 @@ def foot_positions(
       soles[i, side] = (
         data.geom_xpos[ids, 2] - abs(axis_z) * half_length - radius
       ).min()
-  return sites, soles
+  return sites, soles, forward
 
 
 def metrics(
   model: mujoco.MjModel, rows: list[dict], names: list[str], dt: float
 ) -> dict:
-  sites, soles = foot_positions(model, rows, names)
+  sites, soles, foot_forward = foot_geometry(model, rows, names)
   contact = np.asarray([r["foot_contact"] for r in rows], dtype=bool)
   speed = np.asarray([r["actual_velocity"] for r in rows])
   foot_speed = np.asarray([r["posture"]["foot_speed_mps"] for r in rows])
@@ -66,6 +68,23 @@ def metrics(
   foot_gap = ((sites[:, 0, :2] - sites[:, 1, :2]) * heading).sum(-1)
   leftward = np.stack((-heading[:, 1], heading[:, 0]), axis=-1)
   lateral_foot_gap = ((sites[:, 0, :2] - sites[:, 1, :2]) * leftward).sum(-1)
+  foot_yaw = np.rad2deg(
+    np.arctan2(
+      (foot_forward[..., :2] * leftward[:, None, :]).sum(-1),
+      (foot_forward[..., :2] * heading[:, None, :]).sum(-1),
+    )
+  )
+  pelvis = np.asarray([r["pelvis_position_w_m"] for r in rows])
+  travel = pelvis[-1, :2] - pelvis[0, :2]
+  if np.linalg.norm(travel) > 1e-5:
+    path_left = np.array((-travel[1], travel[0])) / np.linalg.norm(travel)
+  else:
+    path_left = leftward[0]
+  sway = (pelvis[:, :2] - pelvis[0, :2]) @ path_left
+  smoothing = min(len(rows), max(1, round(0.12 / dt)))
+  lateral_speed_smoothed = np.convolve(
+    speed[:, 1], np.ones(smoothing) / smoothing, mode="valid"
+  )
   touchdown_events: list[tuple[int, int]] = []
   per_foot = {}
   for side, name in enumerate(SIDES):
@@ -105,6 +124,9 @@ def metrics(
       "stance_knee_pitch_median_deg": float(np.rad2deg(np.median(knee)))
       if len(knee)
       else None,
+      "stance_foot_yaw_median_deg": float(np.median(foot_yaw[active, side]))
+      if active.any()
+      else None,
     }
   touchdown_events.sort()
   alternating = [
@@ -130,9 +152,13 @@ def metrics(
     ],
     "mean_heading_velocity": speed.mean(0).tolist(),
     "pelvis_height_p05_p50_p95_m": np.quantile(
-      [r["pelvis_position_w_m"][2] for r in rows], (0.05, 0.5, 0.95)
+      pelvis[:, 2], (0.05, 0.5, 0.95)
     ).tolist(),
     "pelvis_lateral_speed_std_mps": float(speed[:, 1].std()),
+    "pelvis_lateral_speed_smoothed_std_mps": float(lateral_speed_smoothed.std()),
+    "pelvis_lateral_sway_p95_minus_p05_m": float(
+      np.quantile(sway, 0.95) - np.quantile(sway, 0.05)
+    ),
     "torso_tilt_p50_p90_deg": np.quantile(
       [r["posture"]["torso_tilt_deg"] for r in rows], (0.5, 0.9)
     ).tolist(),

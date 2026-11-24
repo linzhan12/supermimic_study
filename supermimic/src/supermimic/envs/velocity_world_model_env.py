@@ -19,6 +19,7 @@ from supermimic.tasks.velocity_tracking import (
   fall_severity,
   forward_precision_reward,
   gait_phase_features,
+  physical_gait_velocity_reward,
   turn_tracking_reward,
   velocity_reward,
 )
@@ -32,6 +33,10 @@ class VelocityWorldModelEnv(WorldModelEnv):
     self.schedule = term.schedule
     self.use_gait_phase = term.gait_phase is not None
     self.dt = env.unwrapped.step_dt
+    velocity = env.cfg.rewards.get("velocity")
+    self.allow_gait_lateral = (
+      velocity is not None and velocity.func is physical_gait_velocity_reward
+    )
     self.turn_tracking_weight = (
       env.cfg.rewards["turn_tracking"].weight
       if "turn_tracking" in env.cfg.rewards
@@ -86,7 +91,9 @@ class VelocityWorldModelEnv(WorldModelEnv):
     _, _, linear_b, angular_b, q, qd = decompose_rep_state(next_rep_state)
     quat = next_aux_state[..., 3:7]
     linear_w, angular_w = quat_apply(quat, linear_b), quat_apply(quat, angular_b)
-    reward = velocity_reward(quat, linear_w, angular_w, self.command)
+    reward = velocity_reward(
+      quat, linear_w, angular_w, self.command, self.allow_gait_lateral
+    )
     if self.forward_precision_weight:
       reward = reward + self.forward_precision_weight * forward_precision_reward(
         quat, linear_w, angular_w, self.command

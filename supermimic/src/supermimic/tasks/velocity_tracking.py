@@ -29,9 +29,16 @@ def heading_velocity(
   return torch.cat((planar, angular_w[..., 2:3]), dim=-1)
 
 
-def velocity_reward(quat_w, linear_w, angular_w, command):
+def velocity_reward(
+  quat_w, linear_w, angular_w, command, allow_gait_lateral: bool = False
+):
   error = heading_velocity(quat_w, linear_w, angular_w) - command
-  planar = torch.exp(-error[..., :2].square().sum(-1) / 0.25**2)
+  planar_error = error[..., :2]
+  if allow_gait_lateral:
+    # Full-body imitation supervises lateral weight transfer over the cycle.
+    lateral_scale = 1 - forward_gait_gate(command)
+    planar_error = torch.stack((error[..., 0], lateral_scale * error[..., 1]), dim=-1)
+  planar = torch.exp(-planar_error.square().sum(-1) / 0.25**2)
   yaw = torch.exp(-error[..., 2].square() / 0.5**2)
   return (planar + 0.5 * yaw) / 1.5
 
@@ -271,6 +278,17 @@ def physical_velocity_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
   _, quat_w, linear_w, angular_b = physical_root(env)
   command = env.command_manager.get_command("velocity")
   return velocity_reward(quat_w, linear_w, quat_apply(quat_w, angular_b), command)
+
+
+def physical_gait_velocity_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
+  _, quat, linear_w, angular_b = physical_root(env)
+  return velocity_reward(
+    quat,
+    linear_w,
+    quat_apply(quat, angular_b),
+    env.command_manager.get_command("velocity"),
+    allow_gait_lateral=True,
+  )
 
 
 def turn_tracking_reward(yaw_rate: torch.Tensor, command: torch.Tensor) -> torch.Tensor:

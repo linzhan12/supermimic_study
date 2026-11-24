@@ -237,6 +237,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Track continuous mocap targets and allow corrections to all G1 joints."""
   forward_gait_demo_files: str | None = None
   """Comma-separated physical full-reference demonstrations for full-body gait shaping."""
+  forward_gait_weight_transfer: bool = False
+  """Track torso motion and phase-dependent lateral transfer in straight walking."""
+  forward_gait_foot_orientation: bool = False
+  """Track the demonstrated foot axes relative to the robot's heading."""
   forward_foot_cycle_weight: float = 0.0
   """Weight for phase-aligned alternation, clearance and placement of the feet."""
   forward_gait_reflection: float = 0.0

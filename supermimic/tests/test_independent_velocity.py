@@ -11,6 +11,7 @@ from supermimic.tasks.velocity_tracking import (
   VelocitySchedule,
   advance_gait_phase,
   heading_velocity,
+  velocity_reward,
 )
 from tests.conftest import make_mock_command_env, make_mock_representation
 
@@ -100,3 +101,14 @@ def test_walking_clock_advances_continuously_across_speed_changes():
   torch.testing.assert_close(
     new_phase, torch.tensor([0.00352, 0.268, 0.25]), atol=1e-7, rtol=0
   )
+
+
+def test_gait_reward_allows_weight_transfer_and_keeps_steering_errors():
+  quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(3, 1)
+  linear = torch.tensor([[0.35, 0.12, 0.0]]).repeat(3, 1)
+  angular = torch.zeros_like(linear)
+  commands = torch.tensor([[0.35, 0.0, 0.0], [0.35, 0.2, 0.0], [0.35, 0.0, 0.4]])
+  original = velocity_reward(quat, linear, angular, commands)
+  gait = velocity_reward(quat, linear, angular, commands, allow_gait_lateral=True)
+  assert gait[0] == 1 and original[0] < gait[0]
+  torch.testing.assert_close(gait[1:], original[1:], atol=0, rtol=0)

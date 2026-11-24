@@ -48,6 +48,7 @@ from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPo
 from supermimic.tasks.velocity_tracking import (
   configure_velocity_env,
   physical_forward_precision_reward,
+  physical_gait_velocity_reward,
   physical_turn_tracking_reward,
 )
 
@@ -160,6 +161,10 @@ def main() -> None:
     raise ValueError("Full-body gait tracking requires phase-conditioned walking.")
   if args.runner.forward_gait_demo_files and not args.runner.forward_gait_full_body:
     raise ValueError("Separate gait demonstrations require full-body gait tracking.")
+  if args.runner.forward_gait_weight_transfer and not args.runner.forward_gait_full_body:
+    raise ValueError("Phase-dependent weight transfer requires full-body gait tracking.")
+  if args.runner.forward_gait_foot_orientation and not args.runner.forward_gait_weight_transfer:
+    raise ValueError("Foot orientation tracking requires the full-body weight-transfer reward.")
   if steering_recovery_limit and not args.runner.train_steering_recovery and not gait_limit:
     raise ValueError("Freezing steering recovery requires a trainable walking adapter.")
   if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
@@ -253,6 +258,8 @@ def main() -> None:
     configure_velocity_env(
       args.env, gait_fraction=gait_fraction, gait_phase=gait_phase, gait_hold_s=gait_hold_s
     )
+    if args.runner.forward_gait_weight_transfer:
+      args.env.rewards["velocity"].func = physical_gait_velocity_reward
     if precision_weight:
       args.env.rewards["forward_precision"] = RewardTermCfg(
         func=physical_forward_precision_reward, weight=precision_weight
@@ -262,6 +269,8 @@ def main() -> None:
         files = tuple(os.path.expanduser(path.strip()) for path in (args.runner.forward_gait_demo_files or "").split(",") if path.strip())
         args.env.rewards["forward_gait"] = FullBodyGaitRewardCfg(
           func=FullBodyGaitPrior, weight=gait_weight, reference_files=files,
+          transfer_style=args.runner.forward_gait_weight_transfer,
+          foot_orientation=args.runner.forward_gait_foot_orientation,
         )
       else:
         args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)
