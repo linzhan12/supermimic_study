@@ -107,6 +107,7 @@ def predict_tracking_cost(
   *,
   command: torch.Tensor | None = None,
   command_weight: float = 0.0,
+  direction_weight: float = 0.0,
   dt: float = 0.02,
   heading_strength: float = 0.0,
   heading_anchor: torch.Tensor | None = None,
@@ -148,7 +149,7 @@ def predict_tracking_cost(
   origin = torch.stack([w.p[0] for w in windows])
   real_origin = aux[:, :2]
   cost = state.new_zeros(count)
-  use_command = command is not None and command_weight > 0.0
+  use_command = command is not None and (command_weight > 0.0 or direction_weight > 0.0)
   command_start = steps // 3
   twist_sum = state.new_zeros((count, 3))
   previous = aux.expand(count, -1)
@@ -168,9 +169,22 @@ def predict_tracking_cost(
   cost = cost / steps
   if use_command:
     assert command is not None
-    delta = twist_sum / (steps - command_start) - command
-    scaled = delta / delta.new_tensor((0.18, 0.16, 0.50))
+    predicted = twist_sum / (steps - command_start)
+    delta = predicted - command
+    scale = delta.new_tensor((0.18, 0.16, 0.50))
+    scaled = delta / scale
     cost += command_weight * torch.nn.functional.smooth_l1_loss(
       scaled, torch.zeros_like(scaled), reduction="none"
     ).sum(dim=-1)
+    if direction_weight:
+      lateral = command[1].abs() > 0.10
+      turning = command[2].abs() > 0.16
+      direction = torch.stack((lateral & (command[0].abs() > 0.10), lateral, turning))
+      deficit = ((0.45 * command.abs() - predicted * command.sign()) / scale).clamp_min(
+        0.0
+      )
+      unwanted_yaw = ((predicted[:, 2].abs() - 0.14) / scale[2]).clamp_min(0.0)
+      cost += direction_weight * (
+        (deficit * direction).sum(-1) + unwanted_yaw * (lateral & ~turning)
+      )
   return cost.nan_to_num(nan=1000.0, posinf=1000.0, neginf=1000.0)

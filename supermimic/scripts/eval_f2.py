@@ -111,18 +111,23 @@ class Config:
   directional_selection: bool = False
   direct_steering_start: bool = False
   command_cost_weight: float = 0.0
+  direction_cost_weight: float = 0.0
   candidate_entries: int = 1
   axial_cycle_ranking: bool = False
   preserve_axial_phase: bool = False
   steering_measured_seam: bool = False
   steering_split_seam: bool = False
+  project_contact_seam: bool = False
+  rank_contact_seam: bool = False
   start_search_time: float | None = None
+  start_measured_handoff: bool = False
   restart_from_rest: bool = False
   heading_strength: float = 0.0
   diagonal_heading_lock: bool = False
   axial_heading_lock: bool = False
   axial_heading_on_change: bool = False
   contact_launch_duration: float | None = None
+  contact_launch_axial: bool = False
   contact_launch_lean: float = 0.0
   contact_launch_forward_lead: float = 0.0
   rank_contact_launch: bool = False
@@ -331,6 +336,12 @@ def evaluate(cfg: Config) -> None:
     )
   if cfg.command_cost_weight and not cfg.trackability_weight:
     raise ValueError("Command cost requires world-model ranking.")
+  if (
+    not math.isfinite(cfg.direction_cost_weight)
+    or cfg.direction_cost_weight < 0
+    or (cfg.direction_cost_weight and not cfg.trackability_weight)
+  ):
+    raise ValueError("Direction cost needs a finite nonnegative world-model weight.")
   if not 0.0 <= cfg.heading_strength <= 1.0:
     raise ValueError("Heading guidance strength must be in [0, 1].")
   if (cfg.diagonal_heading_lock or cfg.axial_heading_lock) and (
@@ -349,6 +360,8 @@ def evaluate(cfg: Config) -> None:
     raise ValueError(
       "Contact launch needs measured restart and a duration from 0.3 to 0.8 s."
     )
+  if cfg.contact_launch_axial and cfg.contact_launch_duration is None:
+    raise ValueError("Axial launches need measured-support launch candidates.")
   if not 0.0 <= cfg.contact_launch_lean <= 0.24 or (
     cfg.contact_launch_lean > 0.0 and cfg.contact_launch_duration is None
   ):
@@ -381,12 +394,24 @@ def evaluate(cfg: Config) -> None:
     raise ValueError(
       "Split steering seams need the measured seam and an upper-body blend."
     )
+  if cfg.project_contact_seam and not (
+    cfg.steering_measured_seam or cfg.start_measured_handoff
+  ):
+    raise ValueError("Contact projection needs a measured reference seam.")
+  if cfg.rank_contact_seam and (
+    not cfg.project_contact_seam or not cfg.trackability_weight
+  ):
+    raise ValueError(
+      "Ranking support seams requires contact projection and the world model."
+    )
   if cfg.refresh_contact_stand and (
     cfg.contact_stop_duration is None or not cfg.restart_from_rest
   ):
     raise ValueError("Contact stand refresh requires measured stop and restart.")
   if cfg.start_search_time is not None and not 0.0 < cfg.start_search_time <= 1.0:
     raise ValueError("The start search window must be between zero and one second.")
+  if cfg.start_measured_handoff and cfg.reference_bank is None:
+    raise ValueError("A measured start handoff needs a reference bank.")
   if not 1 <= cfg.prediction_steps <= 30:
     raise ValueError("Choose 1–30 world-model prediction steps.")
   if cfg.pace_margin is not None and (
@@ -466,7 +491,11 @@ def evaluate(cfg: Config) -> None:
       if any(part in name for part in ("_hip_", "_knee_", "_ankle_"))
     )
     stance_bridge = None
-    if cfg.contact_stop_duration is not None or cfg.contact_launch_duration is not None:
+    if (
+      cfg.contact_stop_duration is not None
+      or cfg.contact_launch_duration is not None
+      or cfg.project_contact_seam
+    ):
       stance_bridge = StanceBridge(
         sim_env.sim.mj_model,
         robot.indexing.free_joint_q_adr,
@@ -648,6 +677,16 @@ def evaluate(cfg: Config) -> None:
         summary["planning"]["axial_heading_on_change"] = cfg.axial_heading_on_change
       if cfg.steering_split_seam:
         summary["planning"]["steering_split_seam"] = True
+      if cfg.project_contact_seam:
+        summary["planning"]["project_contact_seam"] = True
+      if cfg.rank_contact_seam:
+        summary["planning"]["rank_contact_seam"] = True
+      if cfg.contact_launch_axial:
+        summary["planning"]["contact_launch_axial"] = True
+      if cfg.start_measured_handoff:
+        summary["planning"]["start_measured_handoff"] = True
+      if cfg.direction_cost_weight:
+        summary["planning"]["direction_cost_weight"] = cfg.direction_cost_weight
       if cfg.preserve_axial_phase:
         summary["planning"]["preserve_axial_phase"] = True
       if cfg.contact_adapter is not None:
@@ -728,6 +767,8 @@ def evaluate(cfg: Config) -> None:
             refresh_contact_stand=cfg.refresh_contact_stand,
             steering_split_seam=cfg.steering_split_seam,
             preserve_axial_phase=cfg.preserve_axial_phase,
+            rank_contact_seam=cfg.rank_contact_seam,
+            contact_launch_axial=cfg.contact_launch_axial,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
@@ -851,6 +892,7 @@ def evaluate(cfg: Config) -> None:
               command_weight=0.0
               if pure_forward and planner.mode == "walk"
               else cfg.command_cost_weight,
+              direction_weight=cfg.direction_cost_weight,
               dt=dt,
               heading_strength=cfg.heading_strength,
               heading_anchor=locked_heading,
@@ -861,8 +903,13 @@ def evaluate(cfg: Config) -> None:
             stop_fallback = None
             capture_stop = None
             contact_launch = None
+            project_seam = None
             measured = None
-            if stance_bridge is not None or cfg.steering_measured_seam:
+            if (
+              stance_bridge is not None
+              or cfg.steering_measured_seam
+              or cfg.start_measured_handoff
+            ):
               measured = ReferenceWindow(
                 data.joint_pos,
                 data.joint_vel,
@@ -897,6 +944,13 @@ def evaluate(cfg: Config) -> None:
                   cfg.rank_contact_launch,
                   cfg.contact_launch_forward_lead,
                 )
+              if cfg.project_contact_seam:
+                project_seam = partial(
+                  stance_bridge.project_support_seam,
+                  measured=measured,
+                  foot_speed=foot_speed,
+                  steps=planner.blend_steps,
+                )
             measured_twist = (
               heading_twist(
                 data.root_link_quat_w,
@@ -918,6 +972,8 @@ def evaluate(cfg: Config) -> None:
                 measured_steering_anchor=measured
                 if cfg.steering_measured_seam
                 else None,
+                measured_start_exit=measured if cfg.start_measured_handoff else None,
+                project_seam=project_seam,
               )
             else:
               planner.plan = ReferenceWindow(

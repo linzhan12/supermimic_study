@@ -319,6 +319,32 @@ def test_split_steering_requires_matching_measured_support_for_a_large_arm_gap()
   assert bool((preview.q[8, 12:] < frames.q[0, 12:]).all())
 
 
+def test_support_projection_is_ranked_as_an_alternative_to_the_same_seam():
+  old = window(1)
+  frames = window(90)
+  turn = torch.tensor([0.25, -0.2, 0.0])
+  clip = ReferenceClip("right", "walk", frames, turn.expand(90, -1), torch.zeros(3))
+  planner = LocomotionPlanner(
+    [clip],
+    old,
+    0.02,
+    directional_selection=True,
+    rank_contact_seam=True,
+    trackability_weight=1.0,
+  )
+  shifted = window(90, 0.12)
+  planner.update(
+    turn,
+    torch.tensor([True, True]),
+    lambda windows: torch.tensor([0.2, 0.1]),
+    measured_steering_anchor=old,
+    project_seam=lambda window: shifted,
+  )
+  assert planner.plan is shifted
+  assert [row["projected_support"] for row in planner.last_costs] == [False, True]
+  assert [row["selected"] for row in planner.last_costs] == [False, True]
+
+
 def test_predicted_twist_uses_command_heading_and_wrapped_yaw():
   previous = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
   current = torch.tensor([[-0.01, 0.0, 0.0, 0.01, 0.0, 0.0, -1.0]])
@@ -469,3 +495,33 @@ def test_generated_launches_are_padded_before_world_model_ranking():
   )
   assert planner.plan is second
   assert planner.last_costs[-1]["selected"]
+
+
+def test_axial_generated_step_hands_off_instead_of_repeating_when_speed_is_low():
+  initial = window(1)
+  forward = torch.tensor([0.35, 0.0, 0.0])
+  frames = window(90, 0.08)
+  clip = ReferenceClip("walk", "walk", frames, forward.expand(90, -1), torch.zeros(3))
+  planner = LocomotionPlanner(
+    [clip],
+    initial,
+    0.02,
+    restart_from_rest=True,
+    contact_launch_axial=True,
+  )
+  start = window(21, 0.04)
+  support = torch.tensor([True, True])
+
+  def launches():
+    return [("first-step", start)]
+
+  planner.update(
+    forward, support, observed_twist=torch.zeros(3), contact_launch=launches
+  )
+  assert planner.plan is start
+  for _ in range(20):
+    planner.advance()
+    planner.update(
+      forward, support, observed_twist=torch.zeros(3), contact_launch=launches
+    )
+  assert planner.clip is clip

@@ -92,15 +92,16 @@ class StanceBridge:
     foot_speed: torch.Tensor,
     lean: float = 0.0,
     forward_lead: float = 0.0,
+    swing_side: int | None = None,
   ) -> ReferenceWindow | None:
-    """Shift weight and step toward the requested diagonal using the measured feet."""
+    """Shift weight and step in the requested direction from measured support."""
     if not bool(initial.contact.all()) or bool((foot_speed > 0.25).any()):
       return None
     q0, p0, quat0, anchors = (
       value[0].cpu().double().numpy()
       for value in (initial.q, initial.p, initial.quat, initial.feet)
     )
-    swing = int(float(command[1]) < 0.0)
+    swing = int(float(command[1]) < 0.0) if swing_side is None else swing_side
     support = 1 - swing
     local = torch.cat((command[:2] * (1.10 * duration), command.new_zeros(1)))
     world = quat_apply(yaw_quat(initial.quat[0]), local).cpu().double().numpy()
@@ -281,11 +282,75 @@ class StanceBridge:
         if (span, tilt) != (duration, lean)
       )
     result = []
+    axial = abs(float(command[1])) <= 0.10
+    choices = (0, 1) if axial else (None,)
     for span, tilt in dict.fromkeys(timings):
-      window = self.launch(initial, command, span, foot_speed, tilt, forward_lead)
-      if window is not None:
-        result.append((f"contact-launch-{span:.2f}-{tilt:.2f}", window))
+      for side in choices:
+        window = self.launch(
+          initial, command, span, foot_speed, tilt, forward_lead, side
+        )
+        if window is not None:
+          suffix = "" if side is None else ("-left" if side == 0 else "-right")
+          result.append((f"contact-launch-{span:.2f}-{tilt:.2f}{suffix}", window))
     return result
+
+  def project_support_seam(
+    self,
+    plan: ReferenceWindow,
+    measured: ReferenceWindow,
+    foot_speed: torch.Tensor,
+    steps: int,
+  ) -> ReferenceWindow:
+    """Preserve low-speed measured support while joining a new reference."""
+    locked = (measured.contact[0] & (foot_speed <= 0.25)).cpu().numpy().copy()
+    if not locked.any() or len(plan.q) <= steps:
+      return plan
+    q = plan.q[: steps + 1].cpu().double().numpy().copy()
+    p = plan.p[: steps + 1].cpu().double().numpy()
+    quat = plan.quat[: steps + 1].cpu().double().numpy()
+    contacts = plan.contact[: steps + 1].cpu().numpy()
+    expiry = np.where((~contacts).any(0), (~contacts).argmax(0), steps)
+    anchors = measured.feet[0].cpu().double().numpy()
+    self._update(q[0], p[0], quat[0])
+    anchor_rotation = self.data.site_xmat[self.sites].reshape(2, 3, 3).copy()
+    adjusted_feet = plan.feet[: steps + 1].cpu().double().numpy().copy()
+    for i in range(1, steps):
+      active = locked & (i < expiry)
+      if not active.any():
+        break
+      self._update(q[i], p[i], quat[i])
+      actual = self.data.site_xpos[self.sites].copy()
+      rotation = self.data.site_xmat[self.sites].reshape(2, 3, 3).copy()
+      decay = np.clip((i / expiry[active] - 0.35) / 0.65, 0.0, 1.0)
+      weight = 1.0 - decay**3 * (10 - 15 * decay + 6 * decay**2)
+      actual[active] += weight[:, None] * (anchors[active] - actual[active])
+      for foot, amount in zip(np.flatnonzero(active), weight, strict=True):
+        current, initial = np.empty(4), np.empty(4)
+        mujoco.mju_mat2Quat(current, rotation[foot].reshape(9))
+        mujoco.mju_mat2Quat(initial, anchor_rotation[foot].reshape(9))
+        if np.dot(current, initial) < 0.0:
+          initial = -initial
+        blended = (1 - amount) * current + amount * initial
+        mujoco.mju_quat2Mat(
+          rotation[foot].reshape(9), blended / np.linalg.norm(blended)
+        )
+      if not self._project(q[i], p[i], quat[i], actual, rotation):
+        return plan
+      adjusted_feet[i] = actual
+    angles = plan.q.new_tensor(q)
+    delta = angles - plan.q[: steps + 1]
+    if not bool(delta.any()):
+      return plan
+    correction_rate = torch.gradient(delta, spacing=self.dt, dim=0)[0]
+    correction_rate[0] = correction_rate[-1] = 0.0
+    return ReferenceWindow(
+      torch.cat((angles, plan.q[steps + 1 :])),
+      torch.cat((plan.qd[: steps + 1] + correction_rate, plan.qd[steps + 1 :])),
+      plan.p,
+      plan.quat,
+      torch.cat((plan.feet.new_tensor(adjusted_feet), plan.feet[steps + 1 :])),
+      plan.contact,
+    )
 
   def _update(self, q: np.ndarray, p: np.ndarray, quat: np.ndarray) -> None:
     self.data.qpos[self.joints] = q

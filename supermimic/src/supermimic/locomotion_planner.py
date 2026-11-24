@@ -257,6 +257,8 @@ class LocomotionPlanner:
     refresh_contact_stand: bool = False,
     steering_split_seam: bool = False,
     preserve_axial_phase: bool = False,
+    rank_contact_seam: bool = False,
+    contact_launch_axial: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -275,6 +277,8 @@ class LocomotionPlanner:
     self.refresh_contact_stand = refresh_contact_stand
     self.steering_split_seam = steering_split_seam
     self.preserve_axial_phase = preserve_axial_phase
+    self.rank_contact_seam = rank_contact_seam
+    self.contact_launch_axial = contact_launch_axial
     self.generated_stop = False
     self.settled_contact_stand = False
     self.committed_steps = self.blend_steps
@@ -320,6 +324,8 @@ class LocomotionPlanner:
     observed_twist: torch.Tensor | None = None,
     contact_launch: Callable[[], list[tuple[str, ReferenceWindow]]] | None = None,
     measured_steering_anchor: ReferenceWindow | None = None,
+    measured_start_exit: ReferenceWindow | None = None,
+    project_seam: Callable[[ReferenceWindow], ReferenceWindow] | None = None,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -327,6 +333,7 @@ class LocomotionPlanner:
     )
     if self.offset % self.replan_steps:
       return
+    exiting_start = self.mode == "start"
     moving = bool(command.abs().max() > 0.025)
     direction = (
       self._direction(command)
@@ -399,7 +406,15 @@ class LocomotionPlanner:
       mode == "start"
       and measured_rest
       and contact_launch is not None
-      and direction in ((1, 0), (-1, 0))
+      and (
+        direction in ((1, 0), (-1, 0))
+        or (
+          self.contact_launch_axial
+          and direction == (0, 0)
+          and not exiting_start
+          and float(command[0]) > 0.025
+        )
+      )
     ):
       launches = contact_launch()
       if launches:
@@ -434,6 +449,13 @@ class LocomotionPlanner:
       if moving and direction not in (None, (0, 0), self.active_direction)
       else None
     )
+    if (
+      exiting_start
+      and mode == "walk"
+      and direction in (None, (0, 0))
+      and measured_start_exit is not None
+    ):
+      seam = measured_start_exit
     candidates = self._candidates(
       mode, observed_contact, direction, direct_start, start_goal, seam=seam
     )
@@ -460,6 +482,19 @@ class LocomotionPlanner:
     shortlist = max(4, 2 * entry_count + 2)
     candidates = sorted(candidates, key=lambda candidate: candidate.cost)[:shortlist]
     windows = [self._join(candidate, seam=seam) for candidate in candidates]
+    projected = [False] * len(windows)
+    if seam is not None and project_seam is not None:
+      corrected = [project_seam(window) for window in windows]
+      if self.rank_contact_seam:
+        for candidate, original, projection in zip(
+          candidates[:], windows[:], corrected, strict=True
+        ):
+          if projection is not original:
+            candidates.append(candidate)
+            windows.append(projection)
+            projected.append(True)
+      else:
+        windows = corrected
     prediction = (
       score_prediction(windows).tolist()
       if score_prediction is not None and self.weight > 0
@@ -478,6 +513,7 @@ class LocomotionPlanner:
         "pace_error": candidate.pace_error,
         "world_model": extra,
         "selected": i == best,
+        **({"projected_support": projected[i]} if self.rank_contact_seam else {}),
       }
       for i, (candidate, extra) in enumerate(zip(candidates, prediction, strict=True))
     ]
