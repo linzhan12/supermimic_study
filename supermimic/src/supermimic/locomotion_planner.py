@@ -296,7 +296,13 @@ class LocomotionPlanner:
       score = 7 * pose_cost + 0.025 * rate_cost + 1.2 * contact_cost
       score += 0.3 * observed_cost + 14 * foot_cost + 0.65 * pace_cost
       if self.strict_contact:
-        compatible = common.any(-1) & (pose_cost.sqrt() < 0.26) & (foot_cost < 0.04)
+        # A standing pose can differ in arm posture from the recorded start.
+        # Permit that difference when both feet remain in support at the join.
+        double_support_start = (mode == "start") & common.all(-1)
+        pose_limit = torch.where(double_support_start, 0.32, 0.26)
+        compatible = (
+          common.any(-1) & (pose_cost.sqrt() < pose_limit) & (foot_cost < 0.04)
+        )
         score = score.masked_fill(~compatible, torch.inf)
       if clip is self.clip:
         score = score - 0.20 * (indices == continued)
