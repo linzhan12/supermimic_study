@@ -126,3 +126,21 @@ def test_recovery_waits_for_two_measured_support_feet_and_finishes_its_plan():
   assert planner.mode == "stand"
   assert planner.plan is stopped
   assert not planner.preview().qd.any()
+
+
+def test_start_can_blend_arms_slower_when_measured_leg_support_matches():
+  old = window(1)
+  walk_frames = window(90)
+  tw = walk_frames.q.new_zeros((90, 3))
+  walk = ReferenceClip("walk", "walk", walk_frames, tw, torch.zeros(3))
+  start = window(90, 0.45)
+  start.q[:, :12] = 0.10
+  entry = ReferenceClip("entry", "start", start, tw, torch.zeros(3))
+  planner = LocomotionPlanner([entry, walk], old, 0.02, start_legs=tuple(range(12)))
+
+  planner.update(torch.tensor([0.35, 0.0, 0.0]), torch.tensor([True, True]))
+  preview = planner.preview()
+  assert planner.clip is entry
+  torch.testing.assert_close(preview.q[8, :12], start.q[8, :12])
+  torch.testing.assert_close(preview.q[8, 12:], start.q[8, 12:] * 0.5)
+  torch.testing.assert_close(preview.q[16], start.q[16])

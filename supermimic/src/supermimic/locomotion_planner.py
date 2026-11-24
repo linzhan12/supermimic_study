@@ -167,6 +167,8 @@ class LocomotionPlanner:
     prediction_steps: int = 10,
     pace_margin: float | None = None,
     stop_double_support_pose: float | None = None,
+    start_legs: tuple[int, ...] = (),
+    start_upper_blend: float = 0.32,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -174,6 +176,8 @@ class LocomotionPlanner:
     self.dt = dt
     self.replan_steps = max(1, round(0.10 / dt))
     self.blend_steps = max(3, round(0.16 / dt))
+    self.start_legs = start_legs
+    self.start_blend_steps = max(self.blend_steps, round(start_upper_blend / dt))
     self.preview_length = PREVIEW_STEPS + max(
       self.replan_steps + self.blend_steps + 2, prediction_steps
     )
@@ -212,8 +216,14 @@ class LocomotionPlanner:
     moving = bool(command.abs().max() > 0.025)
     source_frame = self.frame + self.offset
     active = self.clip
-    if active is not None and self.offset < self.blend_steps:
-      return
+    if active is not None:
+      seam = (
+        self.start_blend_steps
+        if active.mode == "start" and self.start_legs
+        else self.blend_steps
+      )
+      if self.offset < seam:
+        return
     if active is None and self.mode == "stop":
       if self.offset < len(self.plan.q) - 1:
         return
@@ -344,6 +354,11 @@ class LocomotionPlanner:
         # Permit that difference when both feet remain in support at the join.
         double_support_start = (mode == "start") & common.all(-1)
         pose_limit = torch.where(double_support_start, 0.32, 0.26)
+        if mode == "start" and self.start_legs:
+          supported = double_support_start & observed_contact.all()
+          leg_gap = frames.q[indices][:, self.start_legs] - old.q[0, self.start_legs]
+          admissible = supported & (leg_gap.square().mean(-1).sqrt() < 0.18)
+          pose_limit = torch.where(admissible, 0.55, pose_limit)
         if mode == "stop" and self.stop_double_support_pose is not None:
           settled_support = common.all(-1) & observed_contact.all()
           pose_limit = torch.where(
@@ -373,11 +388,18 @@ class LocomotionPlanner:
   def _continues(self, candidate: _Candidate) -> bool:
     return candidate.clip is self.clip and candidate.frame == self.frame + self.offset
 
+  def _blend(self, n: torch.Tensor, steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+    u = (n / steps).clamp(max=1.0)
+    amount = u.pow(3) * (10 - 15 * u + 6 * u.square())
+    rate = 30 * u.square() * (1 - u).square() / (steps * self.dt)
+    return amount, rate
+
   def _join(self, candidate: _Candidate) -> ReferenceWindow:
     if self._continues(candidate):
       return self.plan.hold_after(self.offset, self.preview_length)
 
-    count = self.blend_steps + 1
+    split_start = candidate.clip.mode == "start" and bool(self.start_legs)
+    count = (self.start_blend_steps if split_start else self.blend_steps) + 1
     old = self.plan.hold_after(self.offset, count)
     remaining = len(candidate.clip.frames.q) - candidate.frame
     new = candidate.clip.frames.hold_after(
@@ -396,13 +418,20 @@ class LocomotionPlanner:
     new_p += translation
     new_feet += translation
     new_quat = quat_mul(rotation, new.quat)
-    u = torch.linspace(0, 1, count, device=new.q.device)[:, None]
-    blend = u.pow(3) * (10 - 15 * u + 6 * u.square())
-    blend_rate = 30 * u.square() * (1 - u).square() / (self.blend_steps * self.dt)
+    # Keep the baseline sampling exactly when only one whole-body blend is used.
+    n = torch.linspace(0, float(count - 1), count, device=new.q.device)[:, None]
+    blend, blend_rate = self._blend(n, self.blend_steps)
+    joint_blend, joint_rate = blend, blend_rate
+    if split_start:
+      upper_blend, upper_rate = self._blend(n, self.start_blend_steps)
+      joint_blend = upper_blend.expand(-1, new.q.shape[1]).clone()
+      joint_rate = upper_rate.expand_as(joint_blend).clone()
+      joint_blend[:, self.start_legs] = blend
+      joint_rate[:, self.start_legs] = blend_rate
     delta_q = new.q[:count] - old.q
-    q = torch.cat((old.q + blend * delta_q, new.q[count:]))
+    q = torch.cat((old.q + joint_blend * delta_q, new.q[count:]))
     qd = torch.cat(
-      (old.qd.lerp(new.qd[:count], blend) + blend_rate * delta_q, new.qd[count:])
+      (old.qd.lerp(new.qd[:count], joint_blend) + joint_rate * delta_q, new.qd[count:])
     )
     p = torch.cat((old.p.lerp(new_p[:count], blend), new_p[count:]))
     local_quat = new_quat[:count]

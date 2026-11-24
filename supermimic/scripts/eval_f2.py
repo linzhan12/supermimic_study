@@ -95,6 +95,7 @@ class Config:
   stop_double_support_pose: float | None = None
   contact_stop_duration: float | None = None
   contact_stop_max_foot_speed: float | None = None
+  start_upper_blend: float | None = None
   strict_contact: bool = True
 
 
@@ -215,6 +216,12 @@ def evaluate(cfg: Config) -> None:
     raise ValueError(
       "The contact stop foot speed requires a stop duration and a positive limit."
     )
+  if cfg.start_upper_blend is not None and (
+    cfg.reference_bank is None or not 0.16 <= cfg.start_upper_blend <= 0.6
+  ):
+    raise ValueError(
+      "Choose a start upper-body blend from 0.16 to 0.6 s with a reference bank."
+    )
   if (cfg.steady_forward or cfg.extra_forward_speeds) and not cfg.record_posture:
     raise ValueError("The steady forward test requires --record-posture True.")
   if cfg.motion_frames and not cfg.motion_only:
@@ -323,13 +330,13 @@ def evaluate(cfg: Config) -> None:
       torso = robot.body_names.index("torso_link")
       q_stand = data.default_joint_pos[0].clone()
     dt = sim_env.step_dt
+    leg_indices = tuple(
+      i
+      for i, name in enumerate(robot.joint_names)
+      if any(part in name for part in ("_hip_", "_knee_", "_ankle_"))
+    )
     stance_bridge = None
     if cfg.contact_stop_duration is not None:
-      leg_indices = [
-        i
-        for i, name in enumerate(robot.joint_names)
-        if any(part in name for part in ("_hip_", "_knee_", "_ankle_"))
-      ]
       stance_bridge = StanceBridge(
         sim_env.sim.mj_model,
         robot.indexing.free_joint_q_adr,
@@ -435,6 +442,7 @@ def evaluate(cfg: Config) -> None:
         "stop_double_support_pose": cfg.stop_double_support_pose,
         "contact_stop_duration": cfg.contact_stop_duration,
         "contact_stop_max_foot_speed": cfg.contact_stop_max_foot_speed,
+        "start_upper_blend": cfg.start_upper_blend,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -491,6 +499,8 @@ def evaluate(cfg: Config) -> None:
             prediction_steps=cfg.prediction_steps,
             pace_margin=cfg.pace_margin,
             stop_double_support_pose=cfg.stop_double_support_pose,
+            start_legs=leg_indices if cfg.start_upper_blend is not None else (),
+            start_upper_blend=cfg.start_upper_blend or 0.32,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"

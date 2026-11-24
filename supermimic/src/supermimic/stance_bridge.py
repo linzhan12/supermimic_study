@@ -16,7 +16,7 @@ class StanceBridge:
     model: mujoco.MjModel,
     root: torch.Tensor,
     joints: torch.Tensor,
-    legs: list[int],
+    legs: tuple[int, ...],
     sites: torch.Tensor,
     standing: torch.Tensor,
     dt: float,
