@@ -26,6 +26,8 @@ def nominate(
   frames: int,
   count: int,
   directional_transitions: bool = False,
+  quiet_arms: bool = False,
+  forward_speeds: tuple[float, ...] = SPEEDS,
 ) -> dict[str, list[dict]]:
   with np.load(path) as data:
     q, p, quat = (data[key] for key in ("joint_pos", "root_pos_w", "root_quat_w"))
@@ -72,6 +74,21 @@ def nominate(
   high_knee = rolling_mean(np.maximum(knees - 38, 0).mean(axis=1), frames)[:-1]
   tilt_mean = rolling_mean(tilt, frames)[:-1]
   pose_cost = 0.75 * unsupported + 0.03 * high_knee + 0.014 * tilt_mean
+  arm_cost = 0.0
+  if quiet_arms:
+    arm_names = [
+      f"{side}_{joint}_joint"
+      for side in ("left", "right")
+      for joint in ("shoulder_pitch", "shoulder_roll", "elbow")
+    ]
+    arm_pose = q[:, [joint_names.index(name) for name in arm_names]]
+    means = np.stack([rolling_mean(a, frames)[:-1] for a in arm_pose.T], axis=1)
+    means2 = np.stack([rolling_mean(a * a, frames)[:-1] for a in arm_pose.T], axis=1)
+    # Prefer quiet shoulders and elbows around a relaxed, lowered posture.
+    excursion = np.sqrt(np.maximum(means2 - means**2, 0.0)).mean(axis=1)
+    target = np.array((0.12, 0.14, 0.65, 0.12, -0.14, 0.65))
+    posture = np.linalg.norm(means - target, axis=1)
+    arm_cost = 5.0 * excursion + 0.45 * posture
   straight_cost = abs(mean_left) / 0.12 + abs(mean_yaw) / 0.50
   boundary = min(frames // 3, 30)
   index = np.arange(len(mean_forward))
@@ -82,10 +99,11 @@ def nominate(
   scores = {
     f"{target:.2f}": straight_cost
     + pose_cost
+    + arm_cost
     + abs(mean_forward - target) / 0.08
     + 1.2 * low_pace
     + 0.25 * (touchdown_counts.min(axis=1) < 2)
-    for target in SPEEDS
+    for target in forward_speeds
   }
   scores["start"] = (
     straight_cost
@@ -167,18 +185,28 @@ def main() -> None:
   parser.add_argument("--seconds", type=float, default=3.0)
   parser.add_argument("--count", type=int, default=2)
   parser.add_argument("--directional-transitions", action="store_true")
+  parser.add_argument("--quiet-arms", action="store_true")
+  parser.add_argument("--forward-speeds", type=float, nargs="+", default=SPEEDS)
   args = parser.parse_args()
   if not np.isfinite(args.seconds) or args.seconds < 0.2 or args.count < 1:
     parser.error(
       "Choose a window of at least 0.2 seconds and a positive candidate count."
     )
+  if not all(np.isfinite(speed) and speed > 0 for speed in args.forward_speeds):
+    parser.error("Forward scan speeds must be positive and finite.")
   model = mujoco.MjModel.from_xml_path(str(G1_XML))
   frames = round(args.seconds * 50)
   print(
     json.dumps(
       {
         path.stem: nominate(
-          path, model, frames, args.count, args.directional_transitions
+          path,
+          model,
+          frames,
+          args.count,
+          args.directional_transitions,
+          args.quiet_arms,
+          tuple(args.forward_speeds),
         )
         for path in args.motions
       },
