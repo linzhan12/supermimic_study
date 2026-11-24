@@ -1,4 +1,6 @@
+import mujoco
 import torch
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 
 from supermimic.contact_tracking import JOINTS, ContactTrackingAdapter
 from supermimic.locomotion_planner import (
@@ -14,6 +16,7 @@ from supermimic.representations import (
   NUM_GOAL_FRAMES,
   _assemble_goal,
 )
+from supermimic.stance_bridge import StanceBridge
 
 
 def window(length: int, angle: float = 0.0) -> ReferenceWindow:
@@ -129,6 +132,49 @@ def test_recovery_waits_for_two_measured_support_feet_and_finishes_its_plan():
   assert planner.mode == "stand"
   assert planner.plan is stopped
   assert not planner.preview().qd.any()
+
+
+def test_capture_stop_projects_a_measured_support_foot_and_lands_the_other():
+  model = mujoco.MjModel.from_xml_path(str(G1_XML))
+  root = torch.arange(7)
+  joints = torch.as_tensor(model.jnt_qposadr[1:].copy())
+  sites = torch.tensor([model.site(f"{side}_foot").id for side in ("left", "right")])
+  suffix = {"hip_pitch_joint": -0.10, "knee_joint": 0.30, "ankle_pitch_joint": -0.20}
+  names = [model.joint(i).name for i in range(1, model.njnt)]
+  rest = torch.tensor([suffix.get(name.split("_", 1)[-1], 0.0) for name in names])
+  legs = tuple(
+    i
+    for i, name in enumerate(names)
+    if any(p in name for p in ("hip", "knee", "ankle"))
+  )
+  data = mujoco.MjData(model)
+  data.qpos[:7] = (0, 0, 0.765, 1, 0, 0, 0)
+  data.qpos[joints.numpy()] = rest.numpy()
+  mujoco.mj_kinematics(model, data)
+  measured = ReferenceWindow(
+    rest[None],
+    torch.zeros_like(rest[None]),
+    torch.tensor(data.qpos[None, :3], dtype=torch.float32),
+    torch.tensor(data.qpos[None, 3:7], dtype=torch.float32),
+    torch.tensor(data.site_xpos[sites.numpy()][None], dtype=torch.float32),
+    torch.tensor([[False, True]]),
+  )
+  bridge = StanceBridge(model, root, joints, legs, sites, rest, 0.02, 0.4)
+  velocity = torch.tensor([0.15, 0.0, 0.0])
+  plan = bridge.capture_stop(measured, velocity, torch.zeros(2, 3), 0.25)
+  assert plan is not None
+  assert torch.equal(plan.contact[0], measured.contact[0])
+  assert bool(plan.contact[-1].all()) and bool(plan.contact[:, 1].all())
+  assert plan.feet[-1, 0, 1] > plan.feet[-1, 1, 1]
+  for q, p, quat in zip(plan.q, plan.p, plan.quat, strict=True):
+    data.qpos[joints.numpy()], data.qpos[:3], data.qpos[3:7] = (
+      q.numpy(),
+      p.numpy(),
+      quat.numpy(),
+    )
+    mujoco.mj_kinematics(model, data)
+    actual = torch.tensor(data.site_xpos[sites[1]], dtype=torch.float32)
+    assert (actual - measured.feet[0, 1]).norm() < 0.004
 
 
 def test_contact_stand_refreshes_only_on_measured_drift_after_generated_stop():

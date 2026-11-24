@@ -157,6 +157,111 @@ class StanceBridge:
       contact,
     )
 
+  def capture_stop(
+    self,
+    initial: ReferenceWindow,
+    root_velocity: torch.Tensor,
+    foot_velocity: torch.Tensor,
+    max_foot_speed: float,
+  ) -> ReferenceWindow | None:
+    """Add one settling step when only the measured stance foot can be anchored."""
+    if int(initial.contact.sum()) != 1:
+      return None
+    support = int(initial.contact[0, 1])
+    swing = 1 - support
+    if float(foot_velocity[support, :2].norm()) > max_foot_speed:
+      return None
+
+    q0, p0, quat0, anchors = (
+      value[0].cpu().double().numpy()
+      for value in (initial.q, initial.p, initial.quat, initial.feet)
+    )
+    root_v = root_velocity.cpu().double().numpy()
+    swing_v = foot_velocity[swing].cpu().double().numpy().clip(-0.8, 0.8)
+    self._update(q0, p0, quat0)
+    foot_rotations = self.data.site_xmat[self.sites].reshape(2, 3, 3).copy()
+    upright = yaw_quat(initial.quat)[0].cpu().double().numpy()
+    if np.dot(upright, quat0) < 0:
+      upright = -upright
+    frame = np.empty(9)
+    mujoco.mju_quat2Mat(frame, upright)
+    axes = frame.reshape(3, 3)[:2, :2]
+    omega = np.sqrt(9.81 / np.clip(p0[2] - anchors[support, 2], 0.55, 0.85))
+    capture = p0[:2] + root_v[:2] / omega
+    forward, side = axes.T @ (capture - anchors[support, :2])
+    outward = (-1) ** swing
+    landing = anchors[support].copy()
+    landing[:2] += axes @ np.array(
+      [
+        np.clip(forward, -0.12, 0.24),
+        outward * np.clip(outward * side + 0.10, 0.15, 0.29),
+      ]
+    )
+    span = max(3, round(0.30 / self.dt))
+    duration = span * self.dt
+    t = np.linspace(0.0, 1.0, span + 1)
+    ease = t**3 * (10 - 15 * t + 6 * t**2)
+    tangent = t - 6 * t**3 + 8 * t**4 - 3 * t**5
+    n = span + self.count
+    feet = np.broadcast_to(anchors, (n, 2, 3)).copy()
+    feet[: span + 1, swing] += (
+      ease[:, None] * (landing - anchors[swing]) + duration * tangent[:, None] * swing_v
+    )
+    feet[: span + 1, swing, 2] = (
+      np.maximum(feet[: span + 1, swing, 2], anchors[support, 2])
+      + 0.025 * np.sin(np.pi * t) ** 2
+    )
+    feet[0] = anchors
+    feet[span + 1 :, swing] = landing
+
+    halfway = p0.copy()
+    halfway[:2] += np.clip(root_v[:2] * duration * 0.55, -0.10, 0.10)
+    halfway[2] = min(p0[2], 0.79)
+    p = np.empty((n, 3))
+    p[: span + 1] = p0 + ease[:, None] * (halfway - p0)
+    p[: span + 1, :2] += duration * tangent[:, None] * root_v[:2].clip(-0.5, 0.5)
+    finish = halfway.copy()
+    finish[:2] = 0.5 * (landing[:2] + anchors[support, :2])
+    finish[2] = min(halfway[2], 0.78)
+    u = np.linspace(0, 1, self.count)
+    settle = u**3 * (10 - 15 * u + 6 * u**2)
+    p[span:] = halfway + settle[:, None] * (finish - halfway)
+
+    u = np.linspace(0, 1, n)
+    blend = u**3 * (10 - 15 * u + 6 * u**2)
+    q = q0 + blend[:, None] * (self.standing - q0)
+    quat = quat0 + blend[:, None] * (upright - quat0)
+    quat /= np.linalg.norm(quat, axis=1, keepdims=True)
+    # Land the free foot at the same roll and pitch as the measured support foot.
+    swing_rotation, landing_rotation = np.empty(4), np.empty(4)
+    mujoco.mju_mat2Quat(swing_rotation, foot_rotations[swing].reshape(9))
+    mujoco.mju_mat2Quat(landing_rotation, foot_rotations[support].reshape(9))
+    if np.dot(swing_rotation, landing_rotation) < 0.0:
+      landing_rotation = -landing_rotation
+    for index in range(1, n):
+      a = ease[min(index, span)]
+      foot_quat = (1 - a) * swing_rotation + a * landing_rotation
+      foot_quat /= np.linalg.norm(foot_quat)
+      mujoco.mju_quat2Mat(frame, foot_quat)
+      foot_rotations[swing] = frame.reshape(3, 3)
+      if not self._project(
+        q[index], p[index], quat[index], feet[index], foot_rotations
+      ):
+        return None
+    angles = initial.q.new_tensor(q)
+    vel = torch.gradient(angles, spacing=self.dt, dim=0)[0]
+    vel[0], vel[-1] = initial.qd[0], 0.0
+    contact = initial.contact.expand(n, -1).clone()
+    contact[span:, swing] = True
+    return ReferenceWindow(
+      angles,
+      vel,
+      initial.p.new_tensor(p),
+      initial.quat.new_tensor(quat),
+      initial.feet.new_tensor(feet),
+      contact,
+    )
+
   def launch_candidates(
     self,
     initial: ReferenceWindow,

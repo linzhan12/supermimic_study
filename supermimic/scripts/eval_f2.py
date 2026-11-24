@@ -87,6 +87,7 @@ class Config:
   motion_only: bool = False
   motion_window_s: float = 4.0
   motion_frames: tuple[int, ...] = ()
+  probe_stop_step: int | None = None
   reference_bank: Path | None = None
   planned_only: bool = False
   cases: tuple[str, ...] = ()
@@ -102,6 +103,7 @@ class Config:
   stop_double_support_pose: float | None = None
   contact_stop_duration: float | None = None
   contact_stop_max_foot_speed: float | None = None
+  contact_stop_capture: bool = False
   refresh_contact_stand: bool = False
   start_upper_blend: float | None = None
   directional_selection: bool = False
@@ -262,6 +264,8 @@ def evaluate(cfg: Config) -> None:
     raise ValueError(
       "The contact stop foot speed requires a stop duration and a positive limit."
     )
+  if cfg.contact_stop_capture and cfg.contact_stop_duration is None:
+    raise ValueError("A capture step requires the contact stop bridge.")
   if cfg.start_upper_blend is not None and (
     cfg.reference_bank is None or not 0.16 <= cfg.start_upper_blend <= 0.6
   ):
@@ -278,6 +282,12 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("The steady forward test requires --record-posture True.")
   if cfg.motion_frames and not cfg.motion_only:
     raise ValueError("--motion-frames requires --motion-only.")
+  if cfg.probe_stop_step is not None and (
+    cfg.motion_only or cfg.probe_stop_step < 1 or cfg.fixed_plan_dir is not None
+  ):
+    raise ValueError(
+      "The stop probe needs a positive step in the live stand-start case."
+    )
   if cfg.reference_bank is None and (cfg.planned_only or cfg.trackability_weight != 0):
     raise ValueError("Planned evaluation requires --reference-bank.")
   if cfg.prediction_audit_stride < 0 or (
@@ -482,6 +492,20 @@ def evaluate(cfg: Config) -> None:
     env_ids = torch.zeros(1, dtype=torch.long, device=cfg.device)
     scenarios = {}
     stand, walk = STAND_START, WALK_START
+    if cfg.probe_stop_step is not None:
+      if cfg.probe_stop_step >= sum(
+        round(seconds / dt) for _, seconds, _ in stand[:-1]
+      ):
+        raise ValueError("Choose a probe step before the last release.")
+      remaining = cfg.probe_stop_step
+      prefix = []
+      for phase, seconds, command in stand:
+        steps = min(remaining, round(seconds / dt))
+        prefix.append((phase, steps * dt, command))
+        remaining -= steps
+        if remaining == 0:
+          break
+      stand = (*prefix, ("probe_release", 2.0, (0.0, 0.0, 0.0)))
     if cfg.motion_only:
       stand = walk = (("reference", cfg.motion_window_s, (0.0, 0.0, 0.0)),)
     case_definitions = [
@@ -552,6 +576,8 @@ def evaluate(cfg: Config) -> None:
       "joint_position_order": robot.joint_names,
       "cases": {},
     }
+    if cfg.probe_stop_step is not None:
+      summary["probe_stop_step"] = cfg.probe_stop_step
     if cfg.reference_bank is not None:
       summary["planning"] = {
         "bank": str(cfg.reference_bank.resolve()),
@@ -588,6 +614,8 @@ def evaluate(cfg: Config) -> None:
         summary["planning"]["prediction_audit_stride"] = cfg.prediction_audit_stride
       if cfg.fixed_plan_dir is not None:
         summary["planning"]["fixed_plan_dir"] = str(cfg.fixed_plan_dir.resolve())
+      if cfg.contact_stop_capture:
+        summary["planning"]["contact_stop_capture"] = True
       if cfg.contact_adapter is not None:
         summary["planning"].update(
           contact_adapter_sha256=sha256(cfg.contact_adapter),
@@ -754,6 +782,7 @@ def evaluate(cfg: Config) -> None:
               adapter_gain=cfg.adapter_gain,
             )
             stop_fallback = None
+            capture_stop = None
             contact_launch = None
             measured = None
             if stance_bridge is not None or cfg.steering_measured_seam:
@@ -771,6 +800,14 @@ def evaluate(cfg: Config) -> None:
               if cfg.contact_stop_duration is not None:
                 stop_fallback = partial(
                   stance_bridge, measured, foot_speed, cfg.contact_stop_max_foot_speed
+                )
+              if cfg.contact_stop_capture:
+                capture_stop = partial(
+                  stance_bridge.capture_stop,
+                  measured,
+                  data.root_link_lin_vel_w[0],
+                  data.site_lin_vel_w[0, foot_sites],
+                  cfg.contact_stop_max_foot_speed or 0.25,
                 )
               if cfg.contact_launch_duration is not None:
                 contact_launch = partial(
@@ -798,6 +835,7 @@ def evaluate(cfg: Config) -> None:
                 contact[0],
                 score,
                 stop_fallback=stop_fallback,
+                capture_stop=capture_stop,
                 observed_twist=measured_twist,
                 contact_launch=contact_launch,
                 measured_steering_anchor=measured

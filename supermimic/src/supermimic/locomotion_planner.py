@@ -298,6 +298,7 @@ class LocomotionPlanner:
     score_prediction: Callable[[list[ReferenceWindow]], torch.Tensor] | None = None,
     *,
     stop_fallback: Callable[[], ReferenceWindow | None] | None = None,
+    capture_stop: Callable[[], ReferenceWindow | None] | None = None,
     observed_twist: torch.Tensor | None = None,
     contact_launch: Callable[[], list[tuple[str, ReferenceWindow]]] | None = None,
     measured_steering_anchor: ReferenceWindow | None = None,
@@ -423,10 +424,12 @@ class LocomotionPlanner:
       candidates = self._candidates(mode, observed_contact, direction, seam=seam)
     if not candidates:
       self.last_costs = []
-      if mode == "stop" and stop_fallback is not None and bool(observed_contact.all()):
-        recovery = stop_fallback()
-        if recovery is not None:
-          self._commit_generated(recovery, "stop", direction)
+      if mode == "stop":
+        settle = stop_fallback if bool(observed_contact.all()) else capture_stop
+        if settle is not None:
+          recovery = settle()
+          if recovery is not None:
+            self._commit_generated(recovery, "stop", direction)
       return
     if mode == "walk" and self.pace_margin is not None:
       smallest = min(candidate.pace_error for candidate in candidates)
