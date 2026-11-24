@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 
 import mjlab.tasks  # noqa: F401
@@ -17,10 +18,17 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionLoader
-from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
+from mjlab.utils.lab_api.math import quat_conjugate, quat_mul, yaw_quat
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
+from supermimic.locomotion_planner import (
+  LocomotionPlanner,
+  ReferenceClip,
+  ReferenceWindow,
+  heading_twist,
+)
+from supermimic.reference_trackability import predict_tracking_cost
 from supermimic.representations import extract_actor_goal
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import (
@@ -77,14 +85,20 @@ class Config:
   motion_only: bool = False
   motion_window_s: float = 4.0
   motion_frames: tuple[int, ...] = ()
+  reference_bank: Path | None = None
+  planned_only: bool = False
+  cases: tuple[str, ...] = ()
+  trackability_weight: float = 0.0
+  strict_contact: bool = True
 
 
-def heading_velocity(
-  quat_w: torch.Tensor, linear_w: torch.Tensor, angular_w: torch.Tensor
-) -> torch.Tensor:
-  """Return forward and left speed in m/s and world-up yaw rate in rad/s."""
-  planar = quat_apply_inverse(yaw_quat(quat_w), linear_w)[..., :2]
-  return torch.cat((planar, angular_w[..., 2:3]), dim=-1)
+def planned_twist(window: ReferenceWindow, dt: float) -> torch.Tensor:
+  linear = (window.p[1] - window.p[0]) / dt
+  turn = yaw_quat(quat_mul(window.quat[1], quat_conjugate(window.quat[0])))
+  radians = 2 * torch.atan2(turn[3], turn[0])
+  angular = torch.zeros_like(linear)
+  angular[2] = torch.atan2(radians.sin(), radians.cos()) / dt
+  return heading_twist(window.quat[0], linear, angular)
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -95,7 +109,7 @@ def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
     offsets = torch.arange(window, device=linear.device) - window // 2
     indices = (frames[:, None] + offsets).clamp(0, len(linear) - 1)
     linear, angular = linear[indices].mean(1), angular[indices].mean(1)
-  return heading_velocity(motion.root_quat_w, linear, angular)
+  return heading_twist(motion.root_quat_w, linear, angular)
 
 
 def velocity_limits(cfg: VelocityTaskCfg, like: torch.Tensor) -> torch.Tensor:
@@ -185,6 +199,12 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("The steady forward test requires --record-posture True.")
   if cfg.motion_frames and not cfg.motion_only:
     raise ValueError("--motion-frames requires --motion-only.")
+  if cfg.reference_bank is None and (cfg.planned_only or cfg.trackability_weight != 0):
+    raise ValueError("Planned evaluation requires --reference-bank.")
+  if cfg.motion_only and cfg.reference_bank is not None:
+    raise ValueError("Fixed-reference and planned evaluations are separate modes.")
+  if not math.isfinite(cfg.trackability_weight) or cfg.trackability_weight < 0:
+    raise ValueError("The trackability weight must be finite and nonnegative.")
   if cfg.motion_only and (
     cfg.steady_forward or cfg.extra_forward_speeds or cfg.multispeed_profile
   ):
@@ -262,7 +282,7 @@ def evaluate(cfg: Config) -> None:
       robot.joint_names.index(f"waist_{axis}_joint")
       for axis in ("yaw", "roll", "pitch")
     ]
-    if cfg.record_posture:
+    if cfg.record_posture or cfg.reference_bank:
       foot_sites, _ = robot.find_sites(
         tuple(name.replace("_ankle_roll_link", "_foot") for name in feet.primary_names),
         preserve_order=True,
@@ -270,6 +290,20 @@ def evaluate(cfg: Config) -> None:
       torso = robot.body_names.index("torso_link")
       q_stand = data.default_joint_pos[0].clone()
     dt = sim_env.step_dt
+    clips = []
+    if cfg.reference_bank is not None:
+      clips = [
+        ReferenceClip.load(path, tuple(robot.joint_names), cfg.device, dt)
+        for path in sorted(cfg.reference_bank.glob("*.npz"))
+      ]
+      if not clips:
+        raise ValueError(f"No reference clips under {cfg.reference_bank}.")
+    dynamics_path = cfg.checkpoint_dir / "world_model.pt"
+    if cfg.trackability_weight:
+      wm.load_bundle(
+        torch.load(dynamics_path, map_location=cfg.device, weights_only=True)
+      )
+      wm.dynamics.eval()
     sim_ctx = wm.sim_context.read(sim_env)
     env_ids = torch.zeros(1, dtype=torch.long, device=cfg.device)
     scenarios = {}
@@ -294,6 +328,11 @@ def evaluate(cfg: Config) -> None:
       case_definitions.append(
         ("multispeed_profile", cfg.stand_frame, MULTISPEED_PROFILE)
       )
+    if cfg.cases:
+      unknown = set(cfg.cases) - {case for case, _, _ in case_definitions}
+      if unknown:
+        raise ValueError(f"Unknown evaluation cases {sorted(unknown)}.")
+      case_definitions = [row for row in case_definitions if row[0] in cfg.cases]
     for case, frame, phases in case_definitions:
       if case in scenarios:
         raise ValueError(f"Duplicate scenario: {case}")
@@ -333,6 +372,18 @@ def evaluate(cfg: Config) -> None:
       "joint_position_order": robot.joint_names,
       "cases": {},
     }
+    if cfg.reference_bank is not None:
+      summary["planning"] = {
+        "bank": str(cfg.reference_bank.resolve()),
+        "clip_sha256": {
+          p.name: sha256(p) for p in sorted(cfg.reference_bank.glob("*.npz"))
+        },
+        "strict_contact": cfg.strict_contact,
+        "trackability_weight": cfg.trackability_weight,
+        "world_model_sha256": sha256(dynamics_path)
+        if cfg.trackability_weight
+        else None,
+      }
     for case, (frame, schedule) in scenarios.items():
       initial = None
       case_summary = {"reference_frame": frame, "routes": {}}
@@ -340,8 +391,10 @@ def evaluate(cfg: Config) -> None:
       routes = ("scripted_velocity",) if scripted_only else ROUTES
       if cfg.motion_only:
         routes = ("motion",)
+      if clips:
+        routes = ("planned",) if cfg.planned_only else (*routes, "planned")
       for route in routes:
-        task = "motion" if route == "motion" else "velocity"
+        task = "motion" if route in ("motion", "planned") else "velocity"
         actor.set_slot_mix({task: 1.0})
         sim_env.reset()
         motion_cmd.reset_to_frame(env_ids, frame)
@@ -354,7 +407,7 @@ def evaluate(cfg: Config) -> None:
         if initial is None:
           initial = (obs["full_state"].clone(), obs["actor"].clone())
           case_summary["initial_full_state"] = initial[0][0].tolist()
-          case_summary["initial_velocity"] = heading_velocity(
+          case_summary["initial_velocity"] = heading_twist(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w
           )[0].tolist()
         else:
@@ -363,20 +416,35 @@ def evaluate(cfg: Config) -> None:
 
         history = None
         trace = []
+        planner = None
+        if route == "planned":
+          assert feet.data.found is not None
+          initial_window = ReferenceWindow(
+            data.joint_pos.clone(),
+            data.joint_vel.clone(),
+            data.root_link_pos_w.clone(),
+            data.root_link_quat_w.clone(),
+            data.site_pos_w[:, foot_sites].clone(),
+            feet.data.found > 0,
+          )
+          planner = LocomotionPlanner(
+            clips,
+            initial_window,
+            dt,
+            strict_contact=cfg.strict_contact,
+            trackability_weight=cfg.trackability_weight,
+          )
+          if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
+            planner.mode = "walk"
         for step, (phase, scripted_target) in enumerate(schedule):
           ref_frame = int(motion_cmd.time_steps[0])
-          if route == "scripted_velocity":
+          if route in ("scripted_velocity", "planned"):
             target = scripted_target
           else:
             phase, target = "reference", ref_clipped[ref_frame]
-          goal = (
-            extract_actor_goal(obs["goal"])
-            if route == "motion"
-            else velocity_spec.build_inference_goal_obs(target[None])
-          )
-          goal_at_t = goal[0].tolist()
+          state = wm.representation.represent(obs["full_state"])
           sensor = wm.representation.compute_actor_sensor(
-            wm.representation.represent(obs["full_state"]),
+            state,
             sim_ctx,
             sim_actor_obs=obs["actor"],
           ).unsqueeze(1)
@@ -385,10 +453,35 @@ def evaluate(cfg: Config) -> None:
             if history is None
             else torch.cat((history[:, 1:], sensor), dim=1)
           )
+          preview = None
+          if planner is not None:
+            assert feet.data.found is not None
+            aux = wm.representation.extract_aux_state(obs["full_state"])
+
+            score = partial(
+              predict_tracking_cost,
+              actor=actor,
+              dynamics=wm.dynamics,
+              representation=wm.representation,
+              state=state,
+              aux=aux,
+              history=history,
+              context=sim_ctx,
+              steps=10,
+            )
+            planner.update(target, feet.data.found[0] > 0, score)
+            preview = planner.preview()
+            goal = preview.actor_goal(torch.zeros_like(env_ids), aux)
+          elif route == "motion":
+            goal = extract_actor_goal(obs["goal"])
+          else:
+            goal = velocity_spec.build_inference_goal_obs(target[None])
+          goal_at_t = goal[0].tolist()
+          reference_q = motion_cmd.motion.joint_pos[ref_frame]
           actor_obs = build_actor_obs_td({task: goal}, history)
           action = actor(actor_obs)
           obs, reward, terminated, truncated, _ = sim_env.step(action)
-          actual = heading_velocity(
+          actual = heading_twist(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w
           )
           reasons = [
@@ -413,7 +506,7 @@ def evaluate(cfg: Config) -> None:
             "reference_pelvis_quaternion_wxyz": motion_cmd.motion.root_quat_w[
               ref_frame
             ].tolist(),
-            "reference_joint_pos_rad": motion_cmd.motion.joint_pos[ref_frame].tolist(),
+            "reference_joint_pos_rad": reference_q.tolist(),
             "pelvis_position_w_m": data.root_link_pos_w[0].tolist(),
             "pelvis_quaternion_wxyz": data.root_link_quat_w[0].tolist(),
             "waist_rad": data.joint_pos[0, waist].tolist(),
@@ -423,6 +516,24 @@ def evaluate(cfg: Config) -> None:
             "legacy_tracking_reward": reward[0].item(),
             "termination_reasons": reasons,
           }
+          if preview is not None and planner is not None:
+            source = planner.clip
+            row.update(
+              reference_joint_pos_rad=preview.q[1].tolist(),
+              reference_pelvis_position_w_m=preview.p[1].tolist(),
+              reference_pelvis_quaternion_wxyz=preview.quat[1].tolist(),
+              reference_velocity_unclipped=planned_twist(preview, dt).tolist(),
+              planner_filtered_velocity=planner.filtered_command.tolist(),
+              planner_mode=planner.mode,
+              planner_source=source.name if source is not None else None,
+              planner_source_frame=planner.frame + planner.offset
+              if source is not None
+              else None,
+              planner_contact=preview.contact[1].tolist(),
+              planner_candidates=planner.last_costs,
+            )
+            reference_q = preview.q[1]
+            planner.advance()
           if cfg.record_posture:
             torso_quat = data.body_link_quat_w[0, torso]
             torso_tilt = 2 * torch.atan2(
@@ -432,7 +543,7 @@ def evaluate(cfg: Config) -> None:
             row["posture"] = {
               "joint_pos_rad": q.tolist(),
               "foot_position_w_m": data.site_pos_w[0, foot_sites].tolist(),
-              "reference_joint_rms_rad": (q - motion_cmd.motion.joint_pos[ref_frame])
+              "reference_joint_rms_rad": (q - reference_q)
               .square()
               .mean()
               .sqrt()
