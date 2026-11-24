@@ -19,6 +19,7 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionLoader
+from mjlab.utils.lab_api.math import yaw_quat
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
@@ -98,6 +99,7 @@ class Config:
   contact_adapter: Path | None = None
   adapter_gain: float = 1.0
   adapt_ranking: bool = False
+  adapter_steering_only: bool = False
   adapter_probe_phases: tuple[str, ...] = ()
   pace_margin: float | None = None
   stop_double_support_pose: float | None = None
@@ -115,6 +117,7 @@ class Config:
   start_search_time: float | None = None
   restart_from_rest: bool = False
   heading_strength: float = 0.0
+  diagonal_heading_lock: bool = False
   contact_launch_duration: float | None = None
   contact_launch_lean: float = 0.0
   contact_launch_forward_lead: float = 0.0
@@ -302,6 +305,8 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("The contact adapter gain must be between zero and one.")
   if cfg.adapt_ranking and (not cfg.trackability_weight or cfg.contact_adapter is None):
     raise ValueError("Adapted ranking needs a contact adapter and world-model ranking.")
+  if cfg.adapter_steering_only and cfg.contact_adapter is None:
+    raise ValueError("Steering-only adaptation requires a contact adapter.")
   if cfg.fixed_plan_dir is not None and (
     cfg.reference_bank is None or cfg.adapt_ranking
   ):
@@ -324,6 +329,12 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Command cost requires world-model ranking.")
   if not 0.0 <= cfg.heading_strength <= 1.0:
     raise ValueError("Heading guidance strength must be in [0, 1].")
+  if cfg.diagonal_heading_lock and (
+    not cfg.heading_strength or cfg.reference_bank is None
+  ):
+    raise ValueError(
+      "Diagonal heading lock needs bounded heading guidance and a reference bank."
+    )
   if cfg.contact_launch_duration is not None and (
     cfg.reference_bank is None
     or not cfg.restart_from_rest
@@ -616,11 +627,14 @@ def evaluate(cfg: Config) -> None:
         summary["planning"]["fixed_plan_dir"] = str(cfg.fixed_plan_dir.resolve())
       if cfg.contact_stop_capture:
         summary["planning"]["contact_stop_capture"] = True
+      if cfg.diagonal_heading_lock:
+        summary["planning"]["diagonal_heading_lock"] = True
       if cfg.contact_adapter is not None:
         summary["planning"].update(
           contact_adapter_sha256=sha256(cfg.contact_adapter),
           adapter_gain=cfg.adapter_gain,
           adapt_ranking=cfg.adapt_ranking,
+          adapter_steering_only=cfg.adapter_steering_only,
           adapter_probe_phases=cfg.adapter_probe_phases,
         )
     for case, (frame, schedule) in scenarios.items():
@@ -659,6 +673,8 @@ def evaluate(cfg: Config) -> None:
         audit = None
         tape = None
         moved = False
+        last_command_steered = False
+        diagonal_heading = None
         if route == "planned":
           assert feet.data.found is not None
           initial_window = ReferenceWindow(
@@ -752,10 +768,25 @@ def evaluate(cfg: Config) -> None:
             assert feet.data.found is not None
             aux = wm.representation.extract_aux_state(obs["full_state"])
             contact = feet.data.found > 0
+            if (
+              cfg.diagonal_heading_lock
+              and abs(float(target[1])) > 0.10
+              and abs(float(target[2])) <= 0.16
+            ):
+              if diagonal_heading is None:
+                diagonal_heading = yaw_quat(aux[:, 3:])
+            else:
+              diagonal_heading = None
             if adapter is not None:
-              moved |= bool(target.abs().max() > 0.025)
-              adapt_here = moved and (
-                not cfg.adapter_probe_phases or phase in cfg.adapter_probe_phases
+              if bool(target.abs().max() > 0.025):
+                moved = True
+                last_command_steered = (
+                  abs(float(target[1])) > 0.10 or abs(float(target[2])) > 0.16
+                )
+              adapt_here = (
+                moved
+                and (not cfg.adapter_steering_only or last_command_steered)
+                and (not cfg.adapter_probe_phases or phase in cfg.adapter_probe_phases)
               )
             pure_forward = cfg.axial_cycle_ranking and bool(
               (target[0] > 0.025) & (target[1:].abs().max() < 0.025)
@@ -777,6 +808,7 @@ def evaluate(cfg: Config) -> None:
               else cfg.command_cost_weight,
               dt=dt,
               heading_strength=cfg.heading_strength,
+              heading_anchor=diagonal_heading,
               adapter=adapter if adapt_here and cfg.adapt_ranking else None,
               measured_contact=contact,
               adapter_gain=cfg.adapter_gain,
@@ -854,6 +886,7 @@ def evaluate(cfg: Config) -> None:
               yaw_rate=float(target[2]) if cfg.heading_strength else 0.0,
               heading_strength=cfg.heading_strength,
               dt=dt,
+              heading_anchor=diagonal_heading,
             )
           elif route == "motion":
             goal = extract_actor_goal(obs["goal"])
@@ -895,6 +928,7 @@ def evaluate(cfg: Config) -> None:
               wm.representation.extract_aux_state(obs["full_state"]),
               feet.data.found > 0,
               adapt_here,
+              diagonal_heading,
             )
           actual = heading_twist(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w

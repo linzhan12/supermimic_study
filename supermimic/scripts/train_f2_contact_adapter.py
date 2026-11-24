@@ -70,6 +70,10 @@ def collect(paths: tuple[Path, ...], dt: float, horizon: int, device: str) -> di
     block.update(
       context=data["context"].expand(count, -1),
       heading_strength=torch.full((count,), data["heading_strength"]),
+      heading_anchor=data.get("heading_anchor", data["aux"][:, 3:])[steps],
+      heading_lock=data.get("heading_lock", torch.zeros(len(phase), dtype=torch.bool))[
+        steps
+      ],
     )
     for k in ("q", "qd", "p", "quat", "contact"):
       block[f"ref_{k}"] = data["windows"][k][samples, : PREVIEW_STEPS + horizon - 1]
@@ -134,6 +138,8 @@ def objective(batch, wm, actor, adapter, feet, offsets, cfg: Config, gain: float
       yaw_rate=yaw,
       heading_strength=batch["heading_strength"][:, None],
       dt=dt,
+      heading_anchor=batch["heading_anchor"],
+      heading_lock=batch["heading_lock"],
     )
     nominal = actor(build_actor_obs_td({"motion": goal}, history))
     supported = contacts[:, step]

@@ -38,6 +38,7 @@ def tracking_steps(
   dt: float,
   yaw_rate: float,
   heading_strength: float,
+  heading_anchor: torch.Tensor | None = None,
   adapter: ContactTrackingAdapter | None = None,
   command: torch.Tensor | None = None,
   measured_contact: torch.Tensor | None = None,
@@ -58,7 +59,12 @@ def tracking_steps(
     goals = torch.cat(
       [
         window.actor_goal(
-          t, aux[i : i + 1], yaw_rate=yaw_rate, heading_strength=heading_strength, dt=dt
+          t,
+          aux[i : i + 1],
+          yaw_rate=yaw_rate,
+          heading_strength=heading_strength,
+          dt=dt,
+          heading_anchor=heading_anchor,
         )
         for i, window in enumerate(windows)
       ]
@@ -103,6 +109,7 @@ def predict_tracking_cost(
   command_weight: float = 0.0,
   dt: float = 0.02,
   heading_strength: float = 0.0,
+  heading_anchor: torch.Tensor | None = None,
   adapter: ContactTrackingAdapter | None = None,
   measured_contact: torch.Tensor | None = None,
   adapter_gain: float = 1.0,
@@ -128,6 +135,7 @@ def predict_tracking_cost(
     dt=dt,
     yaw_rate=yaw_rate,
     heading_strength=heading_strength,
+    heading_anchor=heading_anchor,
     adapter=adapter,
     command=command,
     measured_contact=measured_contact,

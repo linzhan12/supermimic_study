@@ -340,6 +340,18 @@ def test_batched_reference_goals_match_execution_for_mixed_yaw_commands():
   torch.testing.assert_close(batch, expected, rtol=0, atol=2e-7)
 
 
+def test_diagonal_heading_anchor_works_without_a_yaw_rate_command():
+  ref = window(PREVIEW_STEPS)
+  aux = torch.cat((ref.p[0], ref.quat[0]))[None]
+  anchor = torch.tensor([[0.9950042, 0.0, 0.0, 0.0998334]])
+  steps = torch.zeros(1, dtype=torch.long)
+  plain = ref.actor_goal(steps, aux)
+  locked = ref.actor_goal(steps, aux, heading_strength=0.58, heading_anchor=anchor)
+  content = NUM_GOAL_FRAMES * 2 * ref.q.shape[-1]
+  torch.testing.assert_close(plain[:, :content], locked[:, :content], rtol=0, atol=0)
+  assert not torch.equal(plain[:, content:], locked[:, content:])
+
+
 def test_contact_adapter_preserves_unselected_actions_and_bounds_physical_radians():
   names = (*JOINTS, "left_knee_joint", "left_elbow_joint")
   action_names = tuple(reversed(names))

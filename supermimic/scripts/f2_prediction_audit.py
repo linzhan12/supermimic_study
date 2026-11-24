@@ -53,6 +53,7 @@ class PredictionAudit:
     next_aux: torch.Tensor,
     next_contact: torch.Tensor,
     adapted: bool,
+    heading_anchor: torch.Tensor | None,
   ) -> None:
     if self.previous_plan is not planner.plan:
       self.previous_plan = planner.plan
@@ -73,6 +74,8 @@ class PredictionAudit:
       "next_state": next_state[0],
       "next_aux": next_aux[0],
       "next_contact": next_contact[0],
+      "heading_anchor": aux[0, 3:] if heading_anchor is None else heading_anchor[0],
+      "heading_lock": torch.tensor(heading_anchor is not None),
     }
     self.steps.append(
       {
@@ -152,6 +155,9 @@ class PredictionAudit:
           dt=self.dt,
           yaw_rate=float(cmd[2]) if self.heading_strength else 0.0,
           heading_strength=self.heading_strength,
+          heading_anchor=fields["heading_anchor"][start : start + 1].to(device)
+          if bool(fields["heading_lock"][start])
+          else None,
           adapter=self.adapter if self.steps[start]["adapted"] else None,
           command=cmd,
           measured_contact=fields["contact"][start : start + 1].to(device),
