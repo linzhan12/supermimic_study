@@ -6,6 +6,7 @@ from supermimic.locomotion_planner import (
   ReferenceClip,
   ReferenceWindow,
 )
+from supermimic.reference_trackability import projected_twist
 from supermimic.representations import (
   GOAL_FRAME_STRIDE,
   NUM_GOAL_FRAMES,
@@ -157,3 +158,11 @@ def test_direction_filter_uses_signed_requested_turn():
   planner.update(left_twist[0], torch.tensor([True, True]))
   assert planner.clip is left
   assert [candidate["clip"] for candidate in planner.last_costs] == ["left"]
+
+
+def test_predicted_twist_uses_command_heading_and_wrapped_yaw():
+  previous = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+  current = torch.tensor([[-0.01, 0.0, 0.0, 0.01, 0.0, 0.0, -1.0]])
+  current[:, 3:] = torch.nn.functional.normalize(current[:, 3:], dim=-1)
+  twist = projected_twist(previous, current, 0.02)
+  torch.testing.assert_close(twist, torch.tensor([[0.5, 0.0, 1.0]]), atol=0.001, rtol=0)

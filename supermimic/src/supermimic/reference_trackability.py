@@ -1,11 +1,23 @@
 """Evaluate proposed references through a frozen SuperMimic world model."""
 
 import torch
+from mjlab.utils.lab_api.math import quat_conjugate, quat_mul, yaw_quat
 
-from supermimic.locomotion_planner import PREVIEW_STEPS, ReferenceWindow
+from supermimic.locomotion_planner import PREVIEW_STEPS, ReferenceWindow, heading_twist
 from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.representations import StateRepresentation
 from supermimic.tasks.task_spec import build_actor_obs_td
+
+
+def projected_twist(
+  previous: torch.Tensor, current: torch.Tensor, dt: float
+) -> torch.Tensor:
+  linear = (current[:, :3] - previous[:, :3]) / dt
+  delta = yaw_quat(quat_mul(current[:, 3:], quat_conjugate(previous[:, 3:])))
+  radians = 2 * torch.atan2(delta[:, 3], delta[:, 0])
+  angular = torch.zeros_like(linear)
+  angular[:, 2] = torch.atan2(radians.sin(), radians.cos()) / dt
+  return heading_twist(previous[:, 3:], linear, angular)
 
 
 @torch.no_grad()
@@ -19,6 +31,10 @@ def predict_tracking_cost(
   history: torch.Tensor,
   context: torch.Tensor,
   steps: int,
+  *,
+  command: torch.Tensor | None = None,
+  command_weight: float = 0.0,
+  dt: float = 0.02,
 ) -> torch.Tensor:
   """Roll out the same motion actor that will execute the proposed reference.
 
@@ -40,13 +56,19 @@ def predict_tracking_cost(
   origin = torch.stack([w.p[0] for w in windows])
   real_origin = aux[:, :2]
   cost = state.new_zeros(count)
+  use_command = command is not None and command_weight > 0.0
+  command_start = steps // 3
+  twist_sum = state.new_zeros((count, 3))
   for index in range(steps):
     t = torch.tensor([index], device=state.device)
     goals = torch.cat(
       [window.actor_goal(t, aux[i : i + 1]) for i, window in enumerate(windows)]
     )
     action = actor(build_actor_obs_td({"motion": goals}, history))
+    previous = aux
     aux, state = dynamics(state, action, aux, context)
+    if use_command and index >= command_start:
+      twist_sum += projected_twist(previous, aux, dt)
     joints = representation.joint_state(state)
     q = joints[..., : joint_targets.shape[-1]]
     q_error = ((q - joint_targets[:, index]) / 0.25).square().mean(-1)
@@ -61,4 +83,12 @@ def predict_tracking_cost(
       state, context, aux_state=aux, joint_state=joints, last_action=action
     )
     history = torch.cat((history[:, 1:], sensor.unsqueeze(1)), dim=1)
-  return (cost / steps).nan_to_num(nan=1000.0, posinf=1000.0, neginf=1000.0)
+  cost = cost / steps
+  if use_command:
+    assert command is not None
+    delta = twist_sum / (steps - command_start) - command
+    scaled = delta / delta.new_tensor((0.18, 0.16, 0.50))
+    cost += command_weight * torch.nn.functional.smooth_l1_loss(
+      scaled, torch.zeros_like(scaled), reduction="none"
+    ).sum(dim=-1)
+  return cost.nan_to_num(nan=1000.0, posinf=1000.0, neginf=1000.0)

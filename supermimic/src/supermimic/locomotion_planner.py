@@ -172,6 +172,7 @@ class LocomotionPlanner:
     start_upper_blend: float = 0.32,
     directional_selection: bool = False,
     direct_steering_start: bool = False,
+    candidate_entries: int = 1,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -183,6 +184,7 @@ class LocomotionPlanner:
     self.start_blend_steps = max(self.blend_steps, round(start_upper_blend / dt))
     self.directional_selection = directional_selection
     self.direct_steering_start = direct_steering_start
+    self.candidate_entries = candidate_entries
     self.committed_steps = self.blend_steps
     self.clip_direction = (
       {
@@ -286,7 +288,8 @@ class LocomotionPlanner:
         for candidate in candidates
         if candidate.pace_error <= smallest + self.pace_margin
       ]
-    candidates = sorted(candidates, key=lambda candidate: candidate.cost)[:4]
+    shortlist = max(4, 2 * self.candidate_entries + 2)
+    candidates = sorted(candidates, key=lambda candidate: candidate.cost)[:shortlist]
     windows = [self._join(candidate) for candidate in candidates]
     prediction = (
       score_prediction(windows).tolist()
@@ -412,8 +415,10 @@ class LocomotionPlanner:
         score = score.masked_fill(~compatible, torch.inf)
       if clip is self.clip:
         score = score - 0.20 * (indices == continued)
-      index = int(score.argmin())
-      if torch.isfinite(score[index]):
+      for _ in range(self.candidate_entries):
+        index = int(score.argmin())
+        if not torch.isfinite(score[index]):
+          break
         error = pace_cost.expand_as(score)[index].sqrt().item()
         choices.append(
           _Candidate(
@@ -423,6 +428,9 @@ class LocomotionPlanner:
             error,
             bool(self.start_legs) and (mode == "start" or direct_start),
           )
+        )
+        score = score.masked_fill(
+          (indices - indices[index]).abs() < self.replan_steps, torch.inf
         )
     return choices
 

@@ -18,7 +18,6 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionLoader
-from mjlab.utils.lab_api.math import quat_conjugate, quat_mul, yaw_quat
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
@@ -28,7 +27,7 @@ from supermimic.locomotion_planner import (
   ReferenceWindow,
   heading_twist,
 )
-from supermimic.reference_trackability import predict_tracking_cost
+from supermimic.reference_trackability import predict_tracking_cost, projected_twist
 from supermimic.representations import extract_actor_goal
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import (
@@ -98,16 +97,14 @@ class Config:
   start_upper_blend: float | None = None
   directional_selection: bool = False
   direct_steering_start: bool = False
+  command_cost_weight: float = 0.0
+  candidate_entries: int = 1
   strict_contact: bool = True
 
 
 def planned_twist(window: ReferenceWindow, dt: float) -> torch.Tensor:
-  linear = (window.p[1] - window.p[0]) / dt
-  turn = yaw_quat(quat_mul(window.quat[1], quat_conjugate(window.quat[0])))
-  radians = 2 * torch.atan2(turn[3], turn[0])
-  angular = torch.zeros_like(linear)
-  angular[2] = torch.atan2(radians.sin(), radians.cos()) / dt
-  return heading_twist(window.quat[0], linear, angular)
+  root = torch.cat((window.p[:2], window.quat[:2]), dim=-1)
+  return projected_twist(root[:1], root[1:], dt)[0]
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -240,6 +237,14 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Fixed-reference and planned evaluations are separate modes.")
   if not math.isfinite(cfg.trackability_weight) or cfg.trackability_weight < 0:
     raise ValueError("The trackability weight must be finite and nonnegative.")
+  if not math.isfinite(cfg.command_cost_weight) or cfg.command_cost_weight < 0:
+    raise ValueError(
+      "The world-model command cost weight must be finite and nonnegative."
+    )
+  if cfg.command_cost_weight and not cfg.trackability_weight:
+    raise ValueError("Command cost requires world-model ranking.")
+  if not 1 <= cfg.candidate_entries <= 4:
+    raise ValueError("Choose one to four entry phases per reference.")
   if not 1 <= cfg.prediction_steps <= 30:
     raise ValueError("Choose 1–30 world-model prediction steps.")
   if cfg.pace_margin is not None and (
@@ -453,6 +458,8 @@ def evaluate(cfg: Config) -> None:
         "start_upper_blend": cfg.start_upper_blend,
         "directional_selection": cfg.directional_selection,
         "direct_steering_start": cfg.direct_steering_start,
+        "command_cost_weight": cfg.command_cost_weight,
+        "candidate_entries": cfg.candidate_entries,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -513,6 +520,7 @@ def evaluate(cfg: Config) -> None:
             start_upper_blend=cfg.start_upper_blend or 0.32,
             directional_selection=cfg.directional_selection,
             direct_steering_start=cfg.direct_steering_start,
+            candidate_entries=cfg.candidate_entries,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
@@ -548,6 +556,9 @@ def evaluate(cfg: Config) -> None:
               history=history,
               context=sim_ctx,
               steps=cfg.prediction_steps,
+              command=target,
+              command_weight=cfg.command_cost_weight,
+              dt=dt,
             )
             contact = feet.data.found > 0
             stop_fallback = None
