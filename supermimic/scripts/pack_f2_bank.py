@@ -40,6 +40,8 @@ def pack(
         "root_ang_vel_w",
       )
     }
+    if "period_steps" in source:
+      arrays["period_steps"] = source["period_steps"]
   reference = [
     {
       "pelvis_position_w_m": p,

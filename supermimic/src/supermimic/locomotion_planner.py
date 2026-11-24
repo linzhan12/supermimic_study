@@ -83,6 +83,7 @@ class ReferenceClip:
   frames: ReferenceWindow
   twist: torch.Tensor
   mean_tracking_bias: torch.Tensor
+  period_steps: int = 0
 
   @classmethod
   def load(
@@ -108,6 +109,7 @@ class ReferenceClip:
         )
       }
       contact = torch.tensor(data["foot_contact"], dtype=torch.bool, device=device)
+      period = int(data["period_steps"]) if "period_steps" in data else 0
     frames = ReferenceWindow(
       arrays["joint_pos"],
       arrays["joint_vel"],
@@ -129,13 +131,14 @@ class ReferenceClip:
       or arrays["root_lin_vel_w"].shape != (count, 3)
       or arrays["root_ang_vel_w"].shape != (count, 3)
       or arrays["mean_tracking_bias"].shape != (3,)
+      or not 0 <= period <= count - PREVIEW_STEPS
       or not all(torch.isfinite(a).all() for a in arrays.values())
     ):
       raise ValueError(f"{path}: invalid or incomplete motion reference.")
     twist = heading_twist(
       frames.quat, arrays["root_lin_vel_w"], arrays["root_ang_vel_w"]
     )
-    return cls(path.stem, mode, frames, twist, arrays["mean_tracking_bias"])
+    return cls(path.stem, mode, frames, twist, arrays["mean_tracking_bias"], period)
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,7 @@ class LocomotionPlanner:
     *,
     trackability_weight: float = 0.0,
     strict_contact: bool = True,
+    prediction_steps: int = 10,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -167,7 +171,9 @@ class LocomotionPlanner:
     self.dt = dt
     self.replan_steps = max(1, round(0.10 / dt))
     self.blend_steps = max(3, round(0.16 / dt))
-    self.preview_length = PREVIEW_STEPS + self.replan_steps + self.blend_steps + 2
+    self.preview_length = PREVIEW_STEPS + max(
+      self.replan_steps + self.blend_steps + 2, prediction_steps
+    )
     self.weight = trackability_weight
     self.strict_contact = strict_contact
     self.plan = initial.hold_after(0, self.preview_length)
@@ -263,13 +269,14 @@ class LocomotionPlanner:
         continue
       frames = clip.frames
       last_entry = len(frames.q) - PREVIEW_STEPS
-      indices = torch.arange(last_entry + 1, device=frames.q.device)
+      entries = min(last_entry + 1, clip.period_steps or last_entry + 1)
+      indices = torch.arange(entries, device=frames.q.device)
       if mode == "start":
         indices = indices[: max(1, round(0.28 / self.dt))]
       if mode == "stop":
         indices = indices[: max(1, round(0.80 / self.dt))]
       if clip is self.clip and continued <= last_entry and mode == "walk":
-        indices = indices[continued : continued + 1]
+        indices = torch.tensor([continued], device=frames.q.device)
       # Match ordered support and compare stance feet relative to the pelvis.
       new_contact = frames.contact[indices]
       common = new_contact & old_support
@@ -282,11 +289,15 @@ class LocomotionPlanner:
       foot_cost = (((clip_feet - old_feet).square().sum(-1)) * common).sum(-1)
       pose_cost = (frames.q[indices] - old.q[0]).square().mean(-1)
       rate_cost = (frames.qd[indices] - old.qd[0]).square().mean(-1)
-      pace_steps = max(2, round(0.72 / self.dt))
-      at = (indices[:, None] + torch.arange(pace_steps, device=indices.device)).clamp(
-        max=len(frames.q) - 1
-      )
-      pace = clip.twist[at].mean(dim=1) + clip.mean_tracking_bias
+      if clip.period_steps:
+        pace = clip.twist[: clip.period_steps].mean(dim=0, keepdim=True)
+      else:
+        pace_steps = max(2, round(0.72 / self.dt))
+        at = (indices[:, None] + torch.arange(pace_steps, device=indices.device)).clamp(
+          max=len(frames.q) - 1
+        )
+        pace = clip.twist[at].mean(dim=1)
+      pace = pace + clip.mean_tracking_bias
       target = self.filtered_command
       if mode == "stop":
         target = target * 0.6
