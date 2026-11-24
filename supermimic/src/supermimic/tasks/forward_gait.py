@@ -220,6 +220,7 @@ class FullBodyGaitRewardCfg(RewardTermCfg):
   arm_weight: float = 0.0
   arm_reference_files: tuple[str, ...] = ()
   fast_stance_weight: float = 0.0
+  fast_lateral_scale: float = 1.0
 
 
 class FullBodyGaitPrior(ForwardGaitPrior):
@@ -339,6 +340,9 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       )
     self.fast_stance_weight = (
       cfg.fast_stance_weight if isinstance(cfg, FullBodyGaitRewardCfg) else 0.0
+    )
+    self.fast_lateral_scale = (
+      cfg.fast_lateral_scale if isinstance(cfg, FullBodyGaitRewardCfg) else 1.0
     )
     if self.fast_stance_weight:
       self._prepare_stance_samples(names, q)
@@ -465,6 +469,15 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       joint_error = joint_error + self.arm_weight * arm_error.mean(-1)
     transfer = self._transfer(height, quat, linear_w, q)
     difference = transfer - reference_transfer
+    fast = ((command[:, 0] - 0.35) / 0.15).clamp(0, 1)
+    if self.fast_lateral_scale != 1.0:
+      # Reduce the amplitude of the demonstrated lateral velocity at fast speeds.
+      lateral = (
+        difference[:, 4] + fast * (1 - self.fast_lateral_scale) * reference_transfer[:, 4]
+      )
+      difference = torch.cat(
+        (difference[:, :4], lateral[:, None], difference[:, 5:]), dim=-1
+      )
     n_transfer = len(self.transfer_widths)
     transfer_error = (
       (difference[:, :n_transfer] / self.transfer_widths).square().mean(-1)
@@ -485,7 +498,6 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       support = contact[..., None].clamp_min(1e-5)
       target = (weights @ self.stance_moments).reshape(-1, 2, 2) / support
       stance_error = (self._stance_values(q, transfer) - target) / q.new_tensor((0.12, 0.09))
-      fast = ((command[:, 0] - 0.35) / 0.15).clamp(0, 1)
       error = (contact[..., None] * stance_error.square()).mean((1, 2))
       denominator = denominator + self.fast_stance_weight * fast * error
     return forward_gait_gate(command) / denominator

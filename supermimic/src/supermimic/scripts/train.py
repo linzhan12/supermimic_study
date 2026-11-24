@@ -186,6 +186,11 @@ def main() -> None:
     stance_weight and not args.runner.forward_gait_foot_placement
   ):
     raise ValueError("Fast stance tracking requires physical foot placement and a nonnegative weight.")
+  lateral_scale = args.runner.forward_gait_fast_lateral_scale
+  if not 0 <= lateral_scale <= 1 or (
+    lateral_scale != 1 and not args.runner.forward_gait_weight_transfer
+  ):
+    raise ValueError("Fast lateral scaling requires weight transfer and a scale in [0, 1].")
   if steering_recovery_limit and not args.runner.train_steering_recovery and not gait_limit:
     raise ValueError("Freezing steering recovery requires a trainable walking adapter.")
   if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
@@ -301,6 +306,7 @@ def main() -> None:
           arm_weight=gait_arm_weight,
           arm_reference_files=arm_demos,
           fast_stance_weight=stance_weight,
+          fast_lateral_scale=lateral_scale,
         )
       else:
         args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)

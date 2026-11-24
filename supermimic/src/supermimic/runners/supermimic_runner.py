@@ -251,6 +251,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Optional comma-separated source for the phase-aligned arm targets."""
   forward_gait_fast_stance_weight: float = 0.0
   """Extra weight for fast-walking knee and foot heading targets during support."""
+  forward_gait_fast_lateral_scale: float = 1.0
+  """Scale demonstrated lateral velocity from 0.35 to 0.50 m/s."""
   forward_foot_cycle_weight: float = 0.0
   """Weight for phase-aligned alternation, clearance and placement of the feet."""
   forward_gait_reflection: float = 0.0
