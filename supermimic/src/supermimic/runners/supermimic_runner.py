@@ -243,6 +243,12 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Track the demonstrated foot axes relative to the robot's heading."""
   forward_gait_foot_placement: bool = False
   """Track demonstrated feet relative to the robot's heading and the ground."""
+  forward_gait_demo_reset_fraction: float = 0.0
+  """Fraction of forward resets initialized from a matched physical gait pose and phase."""
+  forward_gait_arm_weight: float = 0.0
+  """Extra weight for matching the demonstrated shoulders and elbows."""
+  forward_gait_arm_demo_files: str | None = None
+  """Optional comma-separated source for the phase-aligned arm targets."""
   forward_foot_cycle_weight: float = 0.0
   """Weight for phase-aligned alternation, clearance and placement of the feet."""
   forward_gait_reflection: float = 0.0

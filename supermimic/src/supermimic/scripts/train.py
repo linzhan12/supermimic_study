@@ -169,6 +169,18 @@ def main() -> None:
     not args.runner.forward_gait_foot_orientation or not args.runner.forward_gait_demo_files
   ):
     raise ValueError("Foot placement requires foot orientation and physical demonstrations.")
+  demo_reset = args.runner.forward_gait_demo_reset_fraction
+  if not 0 <= demo_reset <= 1 or (demo_reset and not args.runner.forward_gait_demo_files):
+    raise ValueError("Gait demonstration resets require physical clips and a fraction in [0, 1].")
+  gait_arm_weight = args.runner.forward_gait_arm_weight
+  if not math.isfinite(gait_arm_weight) or gait_arm_weight < 0 or (
+    gait_arm_weight and not args.runner.forward_gait_full_body
+  ):
+    raise ValueError("The gait arm weight requires full-body gait tracking and a nonnegative weight.")
+  arm_demo_paths = (args.runner.forward_gait_arm_demo_files or "").split(",")
+  arm_demos = tuple(os.path.expanduser(path.strip()) for path in arm_demo_paths if path.strip())
+  if arm_demos and not gait_arm_weight:
+    raise ValueError("Separate arm demonstrations require a nonzero gait arm weight.")
   if steering_recovery_limit and not args.runner.train_steering_recovery and not gait_limit:
     raise ValueError("Freezing steering recovery requires a trainable walking adapter.")
   if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
@@ -280,6 +292,9 @@ def main() -> None:
           transfer_style=args.runner.forward_gait_weight_transfer,
           foot_orientation=args.runner.forward_gait_foot_orientation,
           foot_placement=args.runner.forward_gait_foot_placement,
+          reset_fraction=demo_reset,
+          arm_weight=gait_arm_weight,
+          arm_reference_files=arm_demos,
         )
       else:
         args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)

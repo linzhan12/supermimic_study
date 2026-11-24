@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +19,7 @@ from supermimic.models import build_mlp
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.tasks.velocity_tracking import (
   IndependentVelocityCommand,
+  ReferenceResetCommand,
   advance_gait_phase,
   forward_gait_gate,
   gait_cycle_hz,
@@ -215,6 +216,9 @@ class FullBodyGaitRewardCfg(RewardTermCfg):
   transfer_style: bool = False
   foot_orientation: bool = False
   foot_placement: bool = False
+  reset_fraction: float = 0.0
+  arm_weight: float = 0.0
+  arm_reference_files: tuple[str, ...] = ()
 
 
 class FullBodyGaitPrior(ForwardGaitPrior):
@@ -293,11 +297,68 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       ]
     )
     self.rate_widths = 12 * self.pose_widths
+    self.arm_weight = cfg.arm_weight if isinstance(cfg, FullBodyGaitRewardCfg) else 0.0
+    self.arm_indices = (
+      tuple(
+        names.index(f"{side}_{joint}_joint")
+        for side in ("left", "right")
+        for joint in ("shoulder_pitch", "shoulder_roll", "elbow")
+      )
+      if self.arm_weight
+      else ()
+    )
+    self.arm_samples = None
+    if isinstance(cfg, FullBodyGaitRewardCfg) and cfg.arm_reference_files:
+      arm_prior = ForwardGaitPrior(
+        replace(cfg, reference_files=cfg.arm_reference_files), env
+      )
+      assert arm_prior.phase_samples is not None
+      arm_rows = arm_prior.reference_rows
+      arm_motion = arm_prior.reference_motion
+      arm_q, arm_qd = arm_motion.joint_pos[arm_rows], arm_motion.joint_vel[arm_rows]
+      arm_ids = permutation.new_tensor(self.arm_indices)
+      mirror_ids = permutation[arm_ids]
+      mirror_sign = sign[arm_ids]
+      self.arm_samples = torch.cat(
+        (
+          torch.cat((arm_q[:, arm_ids], arm_qd[:, arm_ids]), dim=-1),
+          torch.cat(
+            (arm_q[:, mirror_ids] * mirror_sign, arm_qd[:, mirror_ids] * mirror_sign),
+            dim=-1,
+          ),
+        )
+      )
+      self.arm_phase_samples = arm_prior.phase_samples
+      self.arm_speeds = arm_prior.speeds
+      self.arm_ids = arm_ids
     self.transfer_widths = q.new_tensor((0.023, 0.13, 0.15, 0.20, 0.10, 0.13))
     if self.style_fk is not None:
       self.transfer_widths = q.new_tensor(
         (0.023, 0.13, 0.15, 0.20, 0.070, 0.13, 0.075, 0.075)
       )
+    if isinstance(cfg, FullBodyGaitRewardCfg) and cfg.reset_fraction:
+      reset = env.command_manager.get_term("motion")
+      assert isinstance(reset, ReferenceResetCommand)
+      self.reset_command = reset
+      self.reset_fraction = cfg.reset_fraction
+      self.command_term.gait_reset = self._reset_from_demonstration
+
+  def _reset_from_demonstration(self, env_ids: torch.Tensor) -> None:
+    command = self.command_term.command[env_ids]
+    chance = torch.rand(len(env_ids), device=env_ids.device)
+    straight = (command[:, 0] >= 0.16) & (command[:, 1:] == 0).all(-1)
+    use_demo = straight & (chance < self.reset_fraction)
+    ids = env_ids[use_demo]
+    if not len(ids):
+      return
+    distance = (command[use_demo, :1] - self.reference_speeds) / 0.04
+    selected = torch.multinomial(torch.softmax(-0.5 * distance.square(), dim=-1), 1)
+    selected = selected.squeeze(-1)
+    self.reset_command.reset_from_gait_demo(
+      self.reference_motion, ids, self.reference_rows[selected]
+    )
+    assert self.reference_phase is not None and self.command_term.gait_phase is not None
+    self.command_term.gait_phase[ids] = self.reference_phase[selected].remainder(1)
 
   def _transfer(
     self,
@@ -349,15 +410,29 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       and quat is not None
       and linear_w is not None
     )
-    similarity = gait_phase_features(phase) @ self.phase_samples.T
+    phase_features = gait_phase_features(phase)
+    similarity = phase_features @ self.phase_samples.T
     speed_error = (command[:, :1] - self.speeds) / 0.075
     # Choose the target from speed and cycle phase only. The policy cannot pick an easier pose.
     weights = torch.softmax(22 * similarity - 0.5 * speed_error.square(), dim=-1)
     reference_q, reference_qd, reference_transfer = (weights @ self.body_samples).split(
       (q.shape[-1], qd.shape[-1], self.body_samples.shape[-1] - 2 * q.shape[-1]), dim=-1
     )
-    q_error = ((q - reference_q) / self.pose_widths).square().mean(-1)
-    qd_error = ((qd - reference_qd) / self.rate_widths).square().mean(-1)
+    if self.arm_samples is not None:
+      arm_similarity = phase_features @ self.arm_phase_samples.T
+      arm_speed_error = (command[:, :1] - self.arm_speeds) / 0.075
+      arm_weights = torch.softmax(
+        22 * arm_similarity - 0.5 * arm_speed_error.square(), dim=-1
+      )
+      arm_q, arm_qd = (arm_weights @ self.arm_samples).chunk(2, dim=-1)
+      reference_q = reference_q.index_copy(1, self.arm_ids, arm_q)
+      reference_qd = reference_qd.index_copy(1, self.arm_ids, arm_qd)
+    pose_error = ((q - reference_q) / self.pose_widths).square()
+    rate_error = ((qd - reference_qd) / self.rate_widths).square()
+    joint_error = 0.60 * pose_error.mean(-1) + 0.17 * rate_error.mean(-1)
+    if self.arm_indices:
+      arm_error = pose_error[:, self.arm_indices] + 0.25 * rate_error[:, self.arm_indices]
+      joint_error = joint_error + self.arm_weight * arm_error.mean(-1)
     difference = self._transfer(height, quat, linear_w, q) - reference_transfer
     n_transfer = len(self.transfer_widths)
     transfer_error = (
@@ -373,9 +448,7 @@ class FullBodyGaitPrior(ForwardGaitPrior):
       placement_widths = difference.new_tensor((0.07, 0.05, 0.025) * 2)
       placement_error = (difference[:, -6:] / placement_widths).square().mean(-1)
       transfer_error = transfer_error + 1.3 * placement_error
-    return forward_gait_gate(command) / (
-      1 + 0.60 * q_error + 0.17 * qd_error + 0.42 * transfer_error
-    )
+    return forward_gait_gate(command) / (1 + joint_error + 0.42 * transfer_error)
 
 
 class ForwardGaitAdapter(nn.Module):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
@@ -14,7 +15,7 @@ from mjlab.managers import (
   RewardTermCfg,
   TerminationTermCfg,
 )
-from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
+from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg, MotionLoader
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, yaw_quat
 
 if TYPE_CHECKING:
@@ -183,6 +184,7 @@ class IndependentVelocityCommand(CommandTerm):
     self.gait_phase = (
       torch.full_like(self.time_left, GAIT_START_PHASE) if cfg.gait_phase else None
     )
+    self.gait_reset: Callable[[torch.Tensor], None] | None = None
 
   @property
   def command(self) -> torch.Tensor:
@@ -195,6 +197,8 @@ class IndependentVelocityCommand(CommandTerm):
     self.time_left[env_ids] = self.steps_left[env_ids] * self._env.step_dt
     if self.gait_phase is not None:
       self.gait_phase[env_ids] = GAIT_START_PHASE
+    if self.gait_reset is not None:
+      self.gait_reset(env_ids)
 
   def compute(self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None):
     ids = slice(None) if env_ids is None else env_ids
@@ -254,6 +258,16 @@ class ReferenceResetCommand(MotionCommand):
       torch.randint(len(self._walking_frames), (count,), device=self.device)
     ]
     return torch.where(torch.rand(count, device=self.device) < 0.25, stand, walk)
+
+  def reset_from_gait_demo(
+    self, motion: MotionLoader, env_ids: torch.Tensor, frames: torch.Tensor
+  ) -> None:
+    root_pos = self._env.scene.env_origins[env_ids].clone()
+    root_pos[:, 2] += motion.root_pos_w[frames, 2]
+    self._write_reference_state_to_sim(
+      env_ids, root_pos, motion.root_quat_w[frames], motion.root_lin_vel_w[frames],
+      motion.root_ang_vel_w[frames], motion.joint_pos[frames], motion.joint_vel[frames],
+    )
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     self.update_relative_body_poses()
