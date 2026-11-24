@@ -146,6 +146,30 @@ class StanceBridge:
       contact,
     )
 
+  def launch_candidates(
+    self,
+    initial: ReferenceWindow,
+    command: torch.Tensor,
+    duration: float,
+    foot_speed: torch.Tensor,
+    lean: float,
+    with_alternatives: bool,
+  ) -> list[tuple[str, ReferenceWindow]]:
+    timings = [(duration, lean)]
+    if with_alternatives:
+      timings.extend(
+        (span, tilt)
+        for span in (duration, min(0.8, duration + 0.12))
+        for tilt in (0.0, 0.06, 0.12)
+        if (span, tilt) != (duration, lean)
+      )
+    result = []
+    for span, tilt in dict.fromkeys(timings):
+      window = self.launch(initial, command, span, foot_speed, tilt)
+      if window is not None:
+        result.append((f"contact-launch-{span:.2f}-{tilt:.2f}", window))
+    return result
+
   def _update(self, q: np.ndarray, p: np.ndarray, quat: np.ndarray) -> None:
     self.data.qpos[self.joints] = q
     self.data.qpos[self.root[:3]] = p

@@ -104,6 +104,7 @@ class Config:
   heading_strength: float = 0.0
   contact_launch_duration: float | None = None
   contact_launch_lean: float = 0.0
+  rank_contact_launch: bool = False
   strict_contact: bool = True
 
 
@@ -263,6 +264,12 @@ def evaluate(cfg: Config) -> None:
   ):
     raise ValueError(
       "Contact launch lean must be 0 to 0.24 rad with contact launch enabled."
+    )
+  if cfg.rank_contact_launch and (
+    cfg.contact_launch_duration is None or not cfg.trackability_weight
+  ):
+    raise ValueError(
+      "Ranking contact launches requires both contact launch and world-model ranking."
     )
   if not 1 <= cfg.candidate_entries <= 4:
     raise ValueError("Choose one to four entry phases per reference.")
@@ -488,6 +495,7 @@ def evaluate(cfg: Config) -> None:
         "heading_strength": cfg.heading_strength,
         "contact_launch_duration": cfg.contact_launch_duration,
         "contact_launch_lean": cfg.contact_launch_lean,
+        "rank_contact_launch": cfg.rank_contact_launch,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -610,12 +618,13 @@ def evaluate(cfg: Config) -> None:
                 )
               if cfg.contact_launch_duration is not None:
                 contact_launch = partial(
-                  stance_bridge.launch,
+                  stance_bridge.launch_candidates,
                   measured,
                   target,
                   cfg.contact_launch_duration,
                   foot_speed,
                   cfg.contact_launch_lean,
+                  cfg.rank_contact_launch,
                 )
             measured_twist = (
               heading_twist(

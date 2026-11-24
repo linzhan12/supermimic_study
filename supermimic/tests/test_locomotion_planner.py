@@ -214,7 +214,7 @@ def test_generated_step_allows_next_direction_when_feet_return_to_rest():
     torch.tensor([0.25, 0.2, 0.0]),
     support,
     observed_twist=torch.zeros(3),
-    contact_launch=lambda: first,
+    contact_launch=lambda: [("first", first)],
   )
   assert planner.plan is first
   for _ in range(20):
@@ -223,6 +223,31 @@ def test_generated_step_allows_next_direction_when_feet_return_to_rest():
     torch.tensor([0.25, -0.2, 0.0]),
     support,
     observed_twist=torch.zeros(3),
-    contact_launch=lambda: second,
+    contact_launch=lambda: [("second", second)],
   )
   assert planner.plan is second
+
+
+def test_generated_launches_are_padded_before_world_model_ranking():
+  old = window(1)
+  frames = window(90)
+  twist = frames.q.new_zeros((90, 3))
+  walk = ReferenceClip("walk", "walk", frames, twist, torch.zeros(3))
+  planner = LocomotionPlanner(
+    [walk], old, 0.02, restart_from_rest=True, trackability_weight=1.0
+  )
+  first, second = window(21), window(25, 0.12)
+
+  def cost(candidates):
+    assert all(len(candidate.q) >= PREVIEW_STEPS for candidate in candidates)
+    return torch.tensor([0.9, 0.4])
+
+  planner.update(
+    torch.tensor([0.25, -0.2, 0.0]),
+    torch.tensor([True, True]),
+    cost,
+    observed_twist=torch.zeros(3),
+    contact_launch=lambda: [("first", first), ("second", second)],
+  )
+  assert planner.plan is second
+  assert planner.last_costs[-1]["selected"]

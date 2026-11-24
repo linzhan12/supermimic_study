@@ -265,7 +265,7 @@ class LocomotionPlanner:
     *,
     stop_fallback: Callable[[], ReferenceWindow | None] | None = None,
     observed_twist: torch.Tensor | None = None,
-    contact_launch: Callable[[], ReferenceWindow | None] | None = None,
+    contact_launch: Callable[[], list[tuple[str, ReferenceWindow]]] | None = None,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -334,9 +334,22 @@ class LocomotionPlanner:
       and contact_launch is not None
       and direction in ((1, 0), (-1, 0))
     ):
-      launch = contact_launch()
-      if launch is not None:
-        self._commit_generated(launch, "start", direction)
+      launches = contact_launch()
+      if launches:
+        windows = [window for _, window in launches]
+        costs = (
+          score_prediction(
+            [window.hold_after(0, self.preview_length) for window in windows]
+          ).tolist()
+          if len(windows) > 1 and score_prediction is not None and self.weight > 0
+          else [0.0] * len(windows)
+        )
+        index = min(range(len(windows)), key=costs.__getitem__)
+        self._commit_generated(windows[index], "start", direction)
+        self.last_costs = [
+          {"clip": name, "world_model": cost, "selected": i == index}
+          for i, ((name, _), cost) in enumerate(zip(launches, costs, strict=True))
+        ]
         return
     direct_start = (
       self.direct_steering_start
