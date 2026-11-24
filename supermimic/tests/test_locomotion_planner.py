@@ -538,6 +538,38 @@ def test_contact_adapter_preserves_unselected_actions_and_bounds_physical_radian
   assert bool((delta.abs() <= 0.03).all())
 
 
+def test_displacement_adapter_uses_reference_travel_in_the_robot_heading():
+  adapter = ContactTrackingAdapter(
+    JOINTS, JOINTS, torch.ones(len(JOINTS)), 0.08, preview_displacement=True
+  )
+  with torch.no_grad():
+    for layer in (adapter.head[0], adapter.head[-1]):
+      layer.weight.zero_()
+      layer.bias.zero_()
+    adapter.head[0].weight[0, -2] = 1.0
+    adapter.head[-1].weight[0, 0] = 1.0
+  action = torch.zeros(2, len(JOINTS))
+  state = torch.zeros(2, 10 + 2 * len(JOINTS))
+  quat = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+  aux = torch.cat((torch.zeros(2, 3), quat), dim=1)
+  root = torch.zeros(2, 9, 3)
+  root[:, 8, 0] = 0.08
+  contact = torch.ones(2, 2, dtype=torch.bool)
+  _, delta = adapter(
+    action,
+    state,
+    aux,
+    torch.zeros(2, 3),
+    action,
+    action,
+    contact,
+    contact,
+    preview_root=adapter.preview_positions(root, 0),
+  )
+  assert delta[0, 0] > 0
+  torch.testing.assert_close(delta[0, 0], -delta[1, 0])
+
+
 def test_generated_step_allows_next_direction_when_feet_return_to_rest():
   initial = window(1)
   walk_frames = window(90)

@@ -54,6 +54,11 @@ def tracking_steps(
   aux = aux.expand(count, -1)
   history = history.expand(count, -1, -1)
   context = context.expand(count, -1)
+  roots = (
+    torch.stack([window.p[: steps + PREVIEW_STEPS - 1] for window in windows])
+    if adapter is not None and adapter.preview_displacement
+    else None
+  )
   for index in range(steps):
     t = torch.tensor([index], device=state.device)
     goals = torch.cat(
@@ -83,6 +88,9 @@ def tracking_steps(
         measured_contact.expand_as(support) if index == 0 else support,
         support,
         adapter_gain,
+        preview_root=adapter.preview_positions(roots, index)
+        if roots is not None
+        else None,
       )
     aux, state = dynamics(state, action, aux, context)
     joints = representation.joint_state(state)

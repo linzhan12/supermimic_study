@@ -560,6 +560,7 @@ def evaluate(cfg: Config) -> None:
         tuple(sim_env.action_manager.get_term("joint_pos").target_names),
         wm.dynamics.action_scale,
         trained["limit_rad"],
+        preview_displacement=trained.get("preview_displacement", False),
       ).to(cfg.device)
       adapter.load_state_dict(trained["adapter"])
       adapter.eval()
@@ -722,6 +723,7 @@ def evaluate(cfg: Config) -> None:
         summary["planning"].update(
           contact_adapter_sha256=sha256(cfg.contact_adapter),
           adapter_gain=cfg.adapter_gain,
+          adapter_preview_displacement=adapter.preview_displacement,
           adapt_ranking=cfg.adapt_ranking,
           adapter_steering_only=cfg.adapter_steering_only,
           adapter_probe_phases=cfg.adapter_probe_phases,
@@ -1053,6 +1055,7 @@ def evaluate(cfg: Config) -> None:
               contact,
               preview.contact[:1],
               cfg.adapter_gain,
+              preview_root=adapter.preview_positions(preview.p[None], 0),
             )
           if audit is not None:
             before_aux = aux.clone()

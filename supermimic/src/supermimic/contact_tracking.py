@@ -1,7 +1,7 @@
 """Bounded contact-phase adjustment for the F2 motion-tracking route."""
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, yaw_quat
 from torch import nn
 
 from supermimic.locomotion_planner import heading_twist
@@ -23,6 +23,8 @@ class ContactTrackingAdapter(nn.Module):
     action_names: tuple[str, ...],
     action_scale: torch.Tensor,
     limit_rad: float,
+    *,
+    preview_displacement: bool = False,
   ) -> None:
     super().__init__()
     if not 0.0 < limit_rad <= 0.12:
@@ -41,11 +43,19 @@ class ContactTrackingAdapter(nn.Module):
     self.register_buffer("actions", indices, persistent=False)
     self.register_buffer("scale", scales.detach().clone(), persistent=False)
     self.limit_rad = limit_rad
+    self.preview_displacement = preview_displacement
     self.head = nn.Sequential(
-      nn.Linear(13 + 2 * len(JOINTS), 48), nn.Tanh(), nn.Linear(48, len(JOINTS))
+      nn.Linear(13 + 2 * len(JOINTS) + 4 * preview_displacement, 48),
+      nn.Tanh(),
+      nn.Linear(48, len(JOINTS)),
     )
     nn.init.zeros_(self.head[-1].weight)
     nn.init.zeros_(self.head[-1].bias)
+
+  def preview_positions(self, root: torch.Tensor, step: int) -> torch.Tensor | None:
+    if not self.preview_displacement:
+      return None
+    return root[..., [step, step + 8], :]
 
   def forward(
     self,
@@ -58,6 +68,8 @@ class ContactTrackingAdapter(nn.Module):
     measured_contact: torch.Tensor,
     reference_contact: torch.Tensor,
     gain: float = 1.0,
+    *,
+    preview_root: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     _, gravity, v, w, q, _ = decompose_rep_state(state)
     rotations = aux[:, 3:]
@@ -75,5 +87,15 @@ class ContactTrackingAdapter(nn.Module):
       ),
       dim=-1,
     )
+    if self.preview_displacement:
+      if preview_root is None:
+        raise ValueError("The displacement adapter needs the reference root preview.")
+      relative = torch.stack(
+        (preview_root[:, 0] - aux[:, :3], preview_root[:, 1] - preview_root[:, 0]),
+        dim=1,
+      )
+      yaw = yaw_quat(rotations)[:, None].expand(-1, 2, -1)
+      displacement = quat_apply_inverse(yaw, relative)[..., :2].flatten(start_dim=1)
+      features = torch.cat((features, displacement / 0.08), dim=-1)
     radians = gain * self.limit_rad * self.head(features.clamp(-5.0, 5.0)).tanh()
     return action.index_add(-1, self.actions, radians / self.scale), radians

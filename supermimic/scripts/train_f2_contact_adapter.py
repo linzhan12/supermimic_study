@@ -44,6 +44,7 @@ class Config:
   learning_rate: float = 0.001
   steering_only: bool = False
   include_replans: bool = False
+  preview_displacement: bool = False
 
 
 def collect(paths: tuple[Path, ...], dt: float, cfg: Config) -> dict:
@@ -91,7 +92,9 @@ def collect(paths: tuple[Path, ...], dt: float, cfg: Config) -> dict:
       blocks.setdefault(k, []).append(value)
     group_names.extend(phase[index] for index in steps)
   if not group_names:
-    raise ValueError("No complete reference windows match the requested focus and horizon.")
+    raise ValueError(
+      "No complete reference windows match the requested focus and horizon."
+    )
   masses = {g: group_names.count(g) for g in set(group_names)}
   return {
     **{k: torch.cat(value).to(cfg.device) for k, value in blocks.items()},
@@ -165,6 +168,7 @@ def objective(batch, wm, actor, adapter, feet, offsets, cfg: Config, gain: float
       batch["contact"] if step == 0 else supported,
       supported,
       gain,
+      preview_root=adapter.preview_positions(ref_p, step),
     )
     aux, state = wm.dynamics(state, action, aux, context)
     z, _, v, w, q, qd = decompose_rep_state(state)
@@ -258,6 +262,7 @@ def main(cfg: Config) -> None:
       tuple(sim.action_manager.get_term("joint_pos").target_names),
       wm.dynamics.action_scale,
       cfg.limit_rad,
+      preview_displacement=cfg.preview_displacement,
     ).to(cfg.device)
     fit = collect(cfg.train, sim.step_dt, cfg)
     validate = collect(cfg.validation, sim.step_dt, cfg) if cfg.validation else None
@@ -306,6 +311,7 @@ def main(cfg: Config) -> None:
         "actor_sha256": sha256(actor_path),
         "world_model_sha256": sha256(model_path),
         "limit_rad": cfg.limit_rad,
+        "preview_displacement": adapter.preview_displacement,
         "dt": sim.step_dt,
       },
       cfg.output_dir / "contact_adapter.pt",
