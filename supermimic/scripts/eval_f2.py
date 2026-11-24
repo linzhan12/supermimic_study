@@ -102,6 +102,8 @@ class Config:
   start_search_time: float | None = None
   restart_from_rest: bool = False
   heading_strength: float = 0.0
+  contact_launch_duration: float | None = None
+  contact_launch_lean: float = 0.0
   strict_contact: bool = True
 
 
@@ -248,6 +250,20 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Command cost requires world-model ranking.")
   if not 0.0 <= cfg.heading_strength <= 1.0:
     raise ValueError("Heading guidance strength must be in [0, 1].")
+  if cfg.contact_launch_duration is not None and (
+    cfg.reference_bank is None
+    or not cfg.restart_from_rest
+    or not 0.3 <= cfg.contact_launch_duration <= 0.8
+  ):
+    raise ValueError(
+      "Contact launch needs measured restart and a duration from 0.3 to 0.8 s."
+    )
+  if not 0.0 <= cfg.contact_launch_lean <= 0.24 or (
+    cfg.contact_launch_lean > 0.0 and cfg.contact_launch_duration is None
+  ):
+    raise ValueError(
+      "Contact launch lean must be 0 to 0.24 rad with contact launch enabled."
+    )
   if not 1 <= cfg.candidate_entries <= 4:
     raise ValueError("Choose one to four entry phases per reference.")
   if cfg.start_search_time is not None and not 0.0 < cfg.start_search_time <= 1.0:
@@ -356,7 +372,7 @@ def evaluate(cfg: Config) -> None:
       if any(part in name for part in ("_hip_", "_knee_", "_ankle_"))
     )
     stance_bridge = None
-    if cfg.contact_stop_duration is not None:
+    if cfg.contact_stop_duration is not None or cfg.contact_launch_duration is not None:
       stance_bridge = StanceBridge(
         sim_env.sim.mj_model,
         robot.indexing.free_joint_q_adr,
@@ -365,7 +381,7 @@ def evaluate(cfg: Config) -> None:
         robot.indexing.site_ids[foot_sites],
         q_stand,
         dt,
-        cfg.contact_stop_duration,
+        cfg.contact_stop_duration or 0.4,
       )
     clips = []
     if cfg.reference_bank is not None:
@@ -470,6 +486,8 @@ def evaluate(cfg: Config) -> None:
         "start_search_time": cfg.start_search_time,
         "restart_from_rest": cfg.restart_from_rest,
         "heading_strength": cfg.heading_strength,
+        "contact_launch_duration": cfg.contact_launch_duration,
+        "contact_launch_lean": cfg.contact_launch_lean,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -575,6 +593,7 @@ def evaluate(cfg: Config) -> None:
             )
             contact = feet.data.found > 0
             stop_fallback = None
+            contact_launch = None
             if stance_bridge is not None:
               measured = ReferenceWindow(
                 data.joint_pos,
@@ -585,9 +604,19 @@ def evaluate(cfg: Config) -> None:
                 contact,
               )
               foot_speed = data.site_lin_vel_w[0, foot_sites, :2].norm(dim=-1)
-              stop_fallback = partial(
-                stance_bridge, measured, foot_speed, cfg.contact_stop_max_foot_speed
-              )
+              if cfg.contact_stop_duration is not None:
+                stop_fallback = partial(
+                  stance_bridge, measured, foot_speed, cfg.contact_stop_max_foot_speed
+                )
+              if cfg.contact_launch_duration is not None:
+                contact_launch = partial(
+                  stance_bridge.launch,
+                  measured,
+                  target,
+                  cfg.contact_launch_duration,
+                  foot_speed,
+                  cfg.contact_launch_lean,
+                )
             measured_twist = (
               heading_twist(
                 data.root_link_quat_w,
@@ -603,6 +632,7 @@ def evaluate(cfg: Config) -> None:
               score,
               stop_fallback=stop_fallback,
               observed_twist=measured_twist,
+              contact_launch=contact_launch,
             )
             preview = planner.preview()
             goal = preview.actor_goal(

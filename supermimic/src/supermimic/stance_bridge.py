@@ -3,7 +3,7 @@
 import mujoco
 import numpy as np
 import torch
-from mjlab.utils.lab_api.math import yaw_quat
+from mjlab.utils.lab_api.math import quat_apply, yaw_quat
 
 from supermimic.locomotion_planner import ReferenceWindow
 
@@ -82,6 +82,68 @@ class StanceBridge:
       initial.quat.new_tensor(quat),
       initial.feet[:1].expand(self.count, -1, -1),
       initial.contact[:1].expand(self.count, -1),
+    )
+
+  def launch(
+    self,
+    initial: ReferenceWindow,
+    command: torch.Tensor,
+    duration: float,
+    foot_speed: torch.Tensor,
+    lean: float = 0.0,
+  ) -> ReferenceWindow | None:
+    """Shift weight and step toward the requested diagonal using the measured feet."""
+    if not bool(initial.contact.all()) or bool((foot_speed > 0.25).any()):
+      return None
+    q0, p0, quat0, anchors = (
+      value[0].cpu().double().numpy()
+      for value in (initial.q, initial.p, initial.quat, initial.feet)
+    )
+    swing = int(float(command[1]) < 0.0)
+    support = 1 - swing
+    local = torch.cat((command[:2] * (1.10 * duration), command.new_zeros(1)))
+    world = quat_apply(yaw_quat(initial.quat[0]), local).cpu().double().numpy()
+    self._update(q0, p0, quat0)
+    foot_rotations = self.data.site_xmat[self.sites].reshape(2, 3, 3).copy()
+    count = round(duration / self.dt) + 1
+    clock = np.linspace(0, 1, count)
+    phase = np.clip((clock - 0.23) / 0.77, 0, 1)
+    travel = phase**3 * (10 - 15 * phase + 6 * phase**2)
+    shift = np.sin(np.pi * clock) ** 2
+    feet = np.broadcast_to(anchors, (count, 2, 3)).copy()
+    feet[:, swing] += travel[:, None] * world
+    feet[:, swing, 2] += 0.055 * np.sin(np.pi * phase) ** 2
+    p = p0 + (0.5 * travel[:, None]) * world
+    toward = anchors[support, :2] - anchors[:, :2].mean(0)
+    p[:, :2] += 0.30 * shift[:, None] * toward
+    p[:, 2] -= 0.018 * shift
+    quat = np.broadcast_to(quat0, (count, 4)).copy()
+    if lean:
+      axis = np.array([-float(command[1]), float(command[0]), 0.0])
+      axis /= np.linalg.norm(axis)
+      rotation = np.zeros(4)
+      for n, amount in enumerate(shift):
+        mujoco.mju_axisAngle2Quat(rotation, axis, lean * amount)
+        mujoco.mju_mulQuat(quat[n], quat0, rotation)
+    q = q0 + (0.34 * travel[:, None]) * (self.standing - q0)
+    for n in range(1, count):
+      if not self._project(q[n], p[n], quat[n], feet[n], foot_rotations):
+        return None
+    angles = initial.q.new_tensor(q)
+    velocity = torch.gradient(angles, spacing=self.dt, dim=0)[0]
+    velocity[0] = initial.qd[0]
+    velocity[-1] = 0.0
+    contact = initial.contact[:1].expand(count, -1).clone()
+    contact[:, swing] = torch.as_tensor(
+      (phase <= 0.0) | (phase >= 1.0), device=contact.device
+    )
+    return ReferenceWindow(
+      angles,
+      velocity,
+      initial.p.new_tensor(p),
+      initial.quat.new_tensor(quat),
+      initial.feet.new_tensor(feet),
+      contact,
     )
 
   def _update(self, q: np.ndarray, p: np.ndarray, quat: np.ndarray) -> None:

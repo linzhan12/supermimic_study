@@ -265,6 +265,7 @@ class LocomotionPlanner:
     *,
     stop_fallback: Callable[[], ReferenceWindow | None] | None = None,
     observed_twist: torch.Tensor | None = None,
+    contact_launch: Callable[[], ReferenceWindow | None] | None = None,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -280,12 +281,28 @@ class LocomotionPlanner:
     )
     source_frame = self.frame + self.offset
     active = self.clip
+    measured_rest = (
+      observed_twist is not None
+      and bool(observed_contact.all())
+      and bool(observed_twist[:2].norm() < 0.08)
+      and abs(float(observed_twist[2])) < 0.15
+    )
     if active is not None and self.offset < self.committed_steps:
       return
     if active is None and self.mode == "stop":
       if self.offset < len(self.plan.q) - 1:
         return
       self.mode = "stand"
+    if (
+      active is None
+      and self.mode == "start"
+      and moving
+      and direction == self.active_direction
+      and self.offset < len(self.plan.q) - 1
+    ):
+      return
+    if active is None and self.mode == "start" and self.offset >= len(self.plan.q) - 1:
+      self.mode = "stand" if measured_rest else "walk"
     if not moving and self.mode == "stand":
       return
     # A start or stop has a task-relevant contact sequence. Finish it unless
@@ -305,15 +322,22 @@ class LocomotionPlanner:
     if moving:
       rested = (
         self.restart_from_rest
-        and self.mode == "stop"
-        and observed_twist is not None
-        and bool(observed_contact.all())
-        and bool(observed_twist[:2].norm() < 0.08)
-        and abs(float(observed_twist[2])) < 0.15
+        and (self.mode == "stop" or active is None)
+        and measured_rest
       )
       mode: Mode = "start" if self.mode == "stand" or rested else "walk"
     else:
       mode = "stop"
+    if (
+      mode == "start"
+      and measured_rest
+      and contact_launch is not None
+      and direction in ((1, 0), (-1, 0))
+    ):
+      launch = contact_launch()
+      if launch is not None:
+        self._commit_generated(launch, "start", direction)
+        return
     direct_start = (
       self.direct_steering_start
       and self.mode in ("stand", "stop")
@@ -336,10 +360,7 @@ class LocomotionPlanner:
       if mode == "stop" and stop_fallback is not None and bool(observed_contact.all()):
         recovery = stop_fallback()
         if recovery is not None:
-          self.plan = recovery
-          self.mode = "stop"
-          self.clip = None
-          self.frame = self.offset = 0
+          self._commit_generated(recovery, "stop", direction)
       return
     if mode == "walk" and self.pace_margin is not None:
       smallest = min(candidate.pace_error for candidate in candidates)
@@ -386,6 +407,16 @@ class LocomotionPlanner:
     self.committed_steps = (
       self.start_blend_steps if choice.split_start else self.blend_steps
     )
+
+  def _commit_generated(
+    self, plan: ReferenceWindow, mode: Mode, direction: tuple[int, int] | None
+  ) -> None:
+    self.plan = plan
+    self.mode = mode
+    self.clip = None
+    self.active_direction = direction
+    self.last_costs = []
+    self.frame = self.offset = 0
 
   @staticmethod
   def _direction(command: torch.Tensor) -> tuple[int, int]:

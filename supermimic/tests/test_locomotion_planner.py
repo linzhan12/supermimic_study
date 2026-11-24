@@ -200,3 +200,29 @@ def test_heading_guide_preserves_joint_goals_and_is_inactive_for_straight_comman
   torch.testing.assert_close(
     reference.actor_goal(steps, aux, heading_strength=0.58), plain, atol=0, rtol=0
   )
+
+
+def test_generated_step_allows_next_direction_when_feet_return_to_rest():
+  initial = window(1)
+  walk_frames = window(90)
+  tw = walk_frames.q.new_zeros((90, 3))
+  walk = ReferenceClip("walk", "walk", walk_frames, tw, torch.zeros(3))
+  planner = LocomotionPlanner([walk], initial, 0.02, restart_from_rest=True)
+  support = torch.tensor([True, True])
+  first, second = window(21, 0.1), window(21, -0.1)
+  planner.update(
+    torch.tensor([0.25, 0.2, 0.0]),
+    support,
+    observed_twist=torch.zeros(3),
+    contact_launch=lambda: first,
+  )
+  assert planner.plan is first
+  for _ in range(20):
+    planner.advance()
+  planner.update(
+    torch.tensor([0.25, -0.2, 0.0]),
+    support,
+    observed_twist=torch.zeros(3),
+    contact_launch=lambda: second,
+  )
+  assert planner.plan is second
