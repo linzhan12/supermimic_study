@@ -42,9 +42,12 @@ class Config:
   seed: int = 0
   command_weight: float = 1.0
   learning_rate: float = 0.001
+  steering_only: bool = False
+  include_replans: bool = False
 
 
-def collect(paths: tuple[Path, ...], dt: float, horizon: int, device: str) -> dict:
+def collect(paths: tuple[Path, ...], dt: float, cfg: Config) -> dict:
+  horizon = cfg.horizon
   blocks = {}
   group_names = []
   for path in paths:
@@ -52,16 +55,23 @@ def collect(paths: tuple[Path, ...], dt: float, horizon: int, device: str) -> di
     if abs(data["dt"] - dt) > 1e-7:
       raise ValueError(f"{path} has a different control interval.")
     phase, revision = data["phase"], data["reference_revision"]
+    steering = []
+    last_steered = False
+    for x, y, yaw in data["command"].tolist():
+      if max(abs(x), abs(y), abs(yaw)) > 0.025:
+        last_steered = abs(y) > 0.10 or abs(yaw) > 0.16
+      steering.append(last_steered)
     samples = [
       i
       for i, step in enumerate(data["window_steps"])
       if phase[step] != "stand"
+      and (not cfg.steering_only or steering[step])
       and step + horizon <= len(phase)
       and phase[step + horizon - 1] == phase[step]
-      and revision[step + horizon - 1] == revision[step]
+      and (cfg.include_replans or revision[step + horizon - 1] == revision[step])
     ]
     if not samples:
-      raise ValueError(f"{path} has no complete windows within one planned reference.")
+      continue
     steps = [data["window_steps"][i] for i in samples]
     count = len(steps)
     block = {
@@ -80,11 +90,13 @@ def collect(paths: tuple[Path, ...], dt: float, horizon: int, device: str) -> di
     for k, value in block.items():
       blocks.setdefault(k, []).append(value)
     group_names.extend(phase[index] for index in steps)
+  if not group_names:
+    raise ValueError("No complete reference windows match the requested focus and horizon.")
   masses = {g: group_names.count(g) for g in set(group_names)}
   return {
-    **{k: torch.cat(value).to(device) for k, value in blocks.items()},
+    **{k: torch.cat(value).to(cfg.device) for k, value in blocks.items()},
     "probabilities": torch.tensor(
-      [masses[g] ** -0.5 for g in group_names], device=device
+      [masses[g] ** -0.5 for g in group_names], device=cfg.device
     ),
     "groups": masses,
   }
@@ -247,12 +259,8 @@ def main(cfg: Config) -> None:
       wm.dynamics.action_scale,
       cfg.limit_rad,
     ).to(cfg.device)
-    fit = collect(cfg.train, sim.step_dt, cfg.horizon, cfg.device)
-    validate = (
-      collect(cfg.validation, sim.step_dt, cfg.horizon, cfg.device)
-      if cfg.validation
-      else None
-    )
+    fit = collect(cfg.train, sim.step_dt, cfg)
+    validate = collect(cfg.validation, sim.step_dt, cfg) if cfg.validation else None
     feet = foot_kinematics(sim, cfg.device)
     offsets = GOAL_FRAME_STRIDE * torch.arange(NUM_GOAL_FRAMES, device=cfg.device)
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=cfg.learning_rate)
