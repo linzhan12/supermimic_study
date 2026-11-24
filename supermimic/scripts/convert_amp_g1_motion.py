@@ -25,12 +25,23 @@ def convert(
     quat = data["body_rotations"][:, pelvis]
   if not np.isfinite(fps) or fps <= 0 or len(root) < 3 or len(positions) != len(root):
     raise ValueError(f"{source}: invalid frame count or sample rate.")
+  source_time = np.arange(len(root)) / (fps * speed_scale)
+  return resample_motion(source, source_time, root, quat, positions, joint_names)
+
+
+def resample_motion(
+  source: Path,
+  source_time: np.ndarray,
+  root: np.ndarray,
+  quat: np.ndarray,
+  positions: np.ndarray,
+  joint_names: list[str],
+) -> dict[str, np.ndarray]:
   if not np.isfinite(positions).all() or not np.isfinite(root).all():
     raise ValueError(f"{source}: nonfinite motion position.")
   if not np.allclose(np.linalg.norm(quat, axis=-1), 1.0, atol=1e-3):
     raise ValueError(f"{source}: invalid pelvis quaternions.")
 
-  source_time = np.arange(len(root)) / (fps * speed_scale)
   time = np.arange(int(np.floor(source_time[-1] * 50 + 1e-8)) + 1) / 50
   if len(time) < 3:
     raise ValueError(f"{source}: less than three output frames.")
@@ -56,6 +67,15 @@ def convert(
   }
 
 
+def g1_joint_names() -> list[str]:
+  model = mujoco.MjModel.from_xml_path(str(G1_XML))
+  return [
+    model.joint(i).name
+    for i in range(model.njnt)
+    if model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE
+  ]
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("output", type=Path)
@@ -69,12 +89,7 @@ def main() -> None:
   args = parser.parse_args()
   if not np.isfinite(args.speed_scale) or args.speed_scale <= 0:
     parser.error("--speed-scale must be finite and positive.")
-  model = mujoco.MjModel.from_xml_path(str(G1_XML))
-  names = [
-    model.joint(i).name
-    for i in range(model.njnt)
-    if model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE
-  ]
+  names = g1_joint_names()
   args.output.mkdir(parents=True, exist_ok=True)
   for source in args.input:
     output = args.output / source.name
