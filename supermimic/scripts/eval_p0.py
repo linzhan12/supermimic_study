@@ -78,6 +78,8 @@ class Config:
   steady_forward: bool = False
   extra_forward_speeds: tuple[float, ...] = ()
   multispeed_profile: bool = False
+  motion_only: bool = False
+  motion_window_s: float = 4.0
 
 
 def reference_velocity(motion: MotionLoader, window: int) -> torch.Tensor:
@@ -176,6 +178,16 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Use a nonnegative seed for paired replay.")
   if (cfg.steady_forward or cfg.extra_forward_speeds) and not cfg.record_posture:
     raise ValueError("The steady forward test requires --record-posture True.")
+  if cfg.motion_only and (
+    cfg.steady_forward or cfg.extra_forward_speeds or cfg.multispeed_profile
+  ):
+    raise ValueError(
+      "Motion-only collection and scripted joystick cases are separate modes."
+    )
+  if cfg.motion_only and (
+    not math.isfinite(cfg.motion_window_s) or cfg.motion_window_s < 0.04
+  ):
+    raise ValueError("Motion-only windows must cover at least 0.04 seconds.")
   if any(not math.isfinite(speed) or speed <= 0 for speed in cfg.extra_forward_speeds):
     raise ValueError("Extra forward speeds must be finite positive m/s values.")
   if cfg.motion_file.suffix != ".npz" or not cfg.motion_file.is_file():
@@ -254,9 +266,12 @@ def evaluate(cfg: Config) -> None:
     sim_ctx = wm.sim_context.read(sim_env)
     env_ids = torch.zeros(1, dtype=torch.long, device=cfg.device)
     scenarios = {}
+    stand, walk = STAND_START, WALK_START
+    if cfg.motion_only:
+      stand = walk = (("reference", cfg.motion_window_s, (0.0, 0.0, 0.0)),)
     case_definitions = [
-      ("stand_start", cfg.stand_frame, STAND_START),
-      ("walk_start", cfg.walk_frame, WALK_START),
+      ("stand_start", cfg.stand_frame, stand),
+      ("walk_start", cfg.walk_frame, walk),
     ]
     if cfg.steady_forward:
       case_definitions.append(("steady_forward", cfg.stand_frame, STEADY_FORWARD))
@@ -312,6 +327,8 @@ def evaluate(cfg: Config) -> None:
       case_summary = {"reference_frame": frame, "routes": {}}
       scripted_only = case.startswith("steady_forward") or case == "multispeed_profile"
       routes = ("scripted_velocity",) if scripted_only else ROUTES
+      if cfg.motion_only:
+        routes = ("motion",)
       for route in routes:
         task = "motion" if route == "motion" else "velocity"
         actor.set_slot_mix({task: 1.0})

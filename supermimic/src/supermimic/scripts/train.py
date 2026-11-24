@@ -42,7 +42,7 @@ from supermimic.scripts.train_utils import (
   setup_device,
 )
 from supermimic.tasks.forward_foot_cycle import ForwardFootCycleReward
-from supermimic.tasks.forward_gait import ForwardGaitPrior
+from supermimic.tasks.forward_gait import ForwardGaitPrior, FullBodyGaitPrior, FullBodyGaitRewardCfg
 from supermimic.tasks.steering_recovery import physical_steering_recovery_reward
 from supermimic.tasks.velocity_posture import VelocityArmSwingReward, VelocityPostureReward
 from supermimic.tasks.velocity_tracking import (
@@ -156,6 +156,12 @@ def main() -> None:
     raise ValueError("A walking hold interval requires extra forward commands and finite bounds.")
   if gait_phase and (not gait_limit or not gait_weight):
     raise ValueError("Phase-conditioned walking requires the gait adapter and reward.")
+  if args.runner.forward_gait_full_body and not gait_phase:
+    raise ValueError("Full-body gait tracking requires phase-conditioned walking.")
+  if args.runner.forward_gait_demo_files and not args.runner.forward_gait_full_body:
+    raise ValueError("Separate gait demonstrations require full-body gait tracking.")
+  if steering_recovery_limit and not args.runner.train_steering_recovery and not gait_limit:
+    raise ValueError("Freezing steering recovery requires a trainable walking adapter.")
   if not 0 <= gait_reflection <= 1 or (gait_reflection and not gait_phase):
     raise ValueError("Walking reflection requires a [0, 1] blend and phase-conditioned walking.")
   if teacher_steps < 0 or (teacher_steps and not gait_phase):
@@ -252,7 +258,13 @@ def main() -> None:
         func=physical_forward_precision_reward, weight=precision_weight
       )
     if gait_weight:
-      args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)
+      if args.runner.forward_gait_full_body:
+        files = tuple(os.path.expanduser(path.strip()) for path in (args.runner.forward_gait_demo_files or "").split(",") if path.strip())
+        args.env.rewards["forward_gait"] = FullBodyGaitRewardCfg(
+          func=FullBodyGaitPrior, weight=gait_weight, reference_files=files,
+        )
+      else:
+        args.env.rewards["forward_gait"] = RewardTermCfg(func=ForwardGaitPrior, weight=gait_weight)
     if foot_cycle_weight:
       args.env.rewards["forward_foot_cycle"] = RewardTermCfg(
         func=ForwardFootCycleReward, weight=foot_cycle_weight

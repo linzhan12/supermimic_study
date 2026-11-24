@@ -118,7 +118,7 @@ class VelocityWorldModelEnv(WorldModelEnv):
       next_phase = advance_gait_phase(self.gait_phase, self.command, self.dt)
     if self.forward_gait is not None:
       reward = reward + self.forward_gait_weight * self.forward_gait.score(
-        height, q, qd, self.command, next_phase
+        height, q, qd, self.command, next_phase, quat, linear_w
       )
     if self.forward_foot_cycle is not None:
       assert next_phase is not None

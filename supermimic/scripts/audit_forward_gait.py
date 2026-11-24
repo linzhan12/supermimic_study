@@ -64,6 +64,8 @@ def metrics(
   yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
   heading = np.stack((np.cos(yaw), np.sin(yaw)), axis=-1)
   foot_gap = ((sites[:, 0, :2] - sites[:, 1, :2]) * heading).sum(-1)
+  leftward = np.stack((-heading[:, 1], heading[:, 0]), axis=-1)
+  lateral_foot_gap = ((sites[:, 0, :2] - sites[:, 1, :2]) * leftward).sum(-1)
   touchdown_events: list[tuple[int, int]] = []
   per_foot = {}
   for side, name in enumerate(SIDES):
@@ -90,6 +92,7 @@ def metrics(
       [active[i : len(active) - 4 + i] for i in range(5)]
     )
     slip = foot_speed[2:-2, side][interior]
+    knee = q[active, names.index(f"{name}_knee_joint")]
     per_foot[name] = {
       "complete_swings": len(swing_peak),
       "peak_sole_clearance_m": swing_peak,
@@ -98,6 +101,9 @@ def metrics(
       "interior_contact_samples": len(slip),
       "interior_contact_site_speed_p90_mps": float(np.quantile(slip, 0.9))
       if len(slip)
+      else None,
+      "stance_knee_pitch_median_deg": float(np.rad2deg(np.median(knee)))
+      if len(knee)
       else None,
     }
   touchdown_events.sort()
@@ -123,6 +129,17 @@ def metrics(
       rows[-1]["reference_frame"],
     ],
     "mean_heading_velocity": speed.mean(0).tolist(),
+    "pelvis_height_p05_p50_p95_m": np.quantile(
+      [r["pelvis_position_w_m"][2] for r in rows], (0.05, 0.5, 0.95)
+    ).tolist(),
+    "pelvis_lateral_speed_std_mps": float(speed[:, 1].std()),
+    "torso_tilt_p50_p90_deg": np.quantile(
+      [r["posture"]["torso_tilt_deg"] for r in rows], (0.5, 0.9)
+    ).tolist(),
+    "foot_separation_lateral_median_m": float(np.median(lateral_foot_gap)),
+    "hip_roll_median_deg": np.rad2deg(
+      np.median(q[:, [names.index(f"{side}_hip_roll_joint") for side in SIDES]], axis=0)
+    ).tolist(),
     "double_support_fraction": float(contact.all(axis=1).mean()),
     "no_support_fraction": float((~contact.any(axis=1)).mean()),
     "alternating_touchdown_interval_s": [n * dt for n in alternating],

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 from mjlab.managers import RewardTermCfg
+from mjlab.tasks.tracking.mdp.commands import MotionLoader
+from mjlab.utils.lab_api.math import quat_apply_inverse
 from torch import nn
 
 from supermimic.models import build_mlp
@@ -23,17 +26,16 @@ from supermimic.tasks.velocity_tracking import (
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
-  from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
   from supermimic.models import MultiEncoderAE
   from supermimic.representations import StateRepresentation
 
 
 def walking_samples(
-  motion: MotionLoader, dt: float
+  motion: MotionLoader, dt: float, *, averaging_s: float = 0.48
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Find sustained forward frames using a centered filter confined to each clip."""
-  half_smooth = max(1, round(0.24 / dt))
+  half_smooth = max(1, round(0.5 * averaging_s / dt))
   context = max(1, round(0.14 / dt))
   rows = torch.arange(motion.time_step_total, device=motion.joint_pos.device)
   clip = torch.bucketize(rows, motion.motion_ends, right=True)
@@ -62,9 +64,18 @@ class ForwardGaitPrior:
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
     motion = env.command_manager.get_term("motion").motion
+    use_physical_demos = isinstance(cfg, FullBodyGaitRewardCfg) and bool(
+      cfg.reference_files
+    )
+    if use_physical_demos:
+      motion = MotionLoader(list(cfg.reference_files), motion.fk, device=env.device)
+    self.reference_motion = motion
     self.command_term = env.command_manager.get_term("velocity")
     assert isinstance(self.command_term, IndependentVelocityCommand)
-    rows, speed = walking_samples(motion, env.step_dt)
+    # Use a stride-length window for tracker rollouts so natural lateral transfer
+    # does not turn an otherwise straight walk into a rejected frame.
+    average_seconds = 1.48 if use_physical_demos else 0.48
+    rows, speed = walking_samples(motion, env.step_dt, averaging_s=average_seconds)
     self.columns = tuple(
       motion.fk.joint_names.index(f"{side}_{joint}_joint")
       for side in ("left", "right")
@@ -139,6 +150,8 @@ class ForwardGaitPrior:
     qd: torch.Tensor,
     command: torch.Tensor,
     phase: torch.Tensor | None = None,
+    quat: torch.Tensor | None = None,
+    linear_w: torch.Tensor | None = None,
   ) -> torch.Tensor:
     state = self._features(height, q[:, self.columns], qd[:, self.columns])
     distance = (
@@ -156,7 +169,7 @@ class ForwardGaitPrior:
     return forward_gait_gate(command) / (1 + cost)
 
   def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-    height, _, _, _ = physical_root(env)
+    height, quat, linear_w, _ = physical_root(env)
     robot = env.scene["robot"]
     command = self.command_term.command
     phase = self.command_term.gait_phase
@@ -164,7 +177,127 @@ class ForwardGaitPrior:
       advance_gait_phase(phase, command, env.step_dt) if phase is not None else None
     )
     return self.score(
-      height, robot.data.joint_pos, robot.data.joint_vel, command, next_phase
+      height,
+      robot.data.joint_pos,
+      robot.data.joint_vel,
+      command,
+      next_phase,
+      quat,
+      linear_w,
+    )
+
+
+def sagittal_joint_mapping(
+  names: tuple[str, ...], like: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+  partners = []
+  for name in names:
+    if name.startswith("left_"):
+      partner = "right_" + name.removeprefix("left_")
+    elif name.startswith("right_"):
+      partner = "left_" + name.removeprefix("right_")
+    else:
+      partner = name
+    partners.append(names.index(partner))
+  sign = like.new_tensor(
+    [-1 if "_roll_" in name or "_yaw_" in name else 1 for name in names]
+  )
+  return torch.tensor(partners, device=like.device), sign
+
+
+@dataclass(kw_only=True)
+class FullBodyGaitRewardCfg(RewardTermCfg):
+  reference_files: tuple[str, ...] = ()
+
+
+class FullBodyGaitPrior(ForwardGaitPrior):
+  """Track speed- and phase-conditioned mocap, including weight transfer."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg, env)
+    assert self.phase_samples is not None
+    motion = self.reference_motion
+    rows = self.reference_rows
+    names = tuple(motion.fk.joint_names)
+    q = motion.joint_pos[rows]
+    qd = motion.joint_vel[rows]
+    permutation, sign = sagittal_joint_mapping(names, q)
+    quat = motion.root_quat_w[rows]
+    transfer = self._transfer(
+      motion.root_pos_w[rows, 2], quat, motion.root_lin_vel_w[rows]
+    )
+    self.body_samples = torch.cat(
+      (
+        torch.cat((q, qd, transfer), dim=-1),
+        torch.cat(
+          (
+            q[:, permutation] * sign,
+            qd[:, permutation] * sign,
+            transfer * q.new_tensor((1, 1, -1, 1, -1, 1)),
+          ),
+          dim=-1,
+        ),
+      )
+    )
+    # Keep errors in physical units and emphasize hips and trunk, which control weight transfer.
+    self.pose_widths = q.new_tensor(
+      [
+        0.11
+        if "hip_roll" in name or name.startswith("waist_")
+        else 0.17
+        if "hip_" in name or "knee" in name or "ankle_" in name
+        else 0.20
+        if "shoulder_" in name or "elbow" in name
+        else 0.32
+        for name in names
+      ]
+    )
+    self.rate_widths = 12 * self.pose_widths
+    self.transfer_widths = q.new_tensor((0.023, 0.13, 0.15, 0.20, 0.10, 0.13))
+
+  @staticmethod
+  def _transfer(
+    height: torch.Tensor, quat: torch.Tensor, linear_w: torch.Tensor
+  ) -> torch.Tensor:
+    heading = heading_velocity(quat, linear_w, torch.zeros_like(linear_w))
+    up = quat_apply_inverse(quat, quat.new_tensor((0.0, 0.0, 1.0)).expand_as(linear_w))
+    return torch.cat((height[:, None], up, heading[:, 1:2], linear_w[:, 2:3]), dim=-1)
+
+  def score(
+    self,
+    height: torch.Tensor,
+    q: torch.Tensor,
+    qd: torch.Tensor,
+    command: torch.Tensor,
+    phase: torch.Tensor | None = None,
+    quat: torch.Tensor | None = None,
+    linear_w: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    assert (
+      self.phase_samples is not None
+      and phase is not None
+      and quat is not None
+      and linear_w is not None
+    )
+    similarity = gait_phase_features(phase) @ self.phase_samples.T
+    speed_error = (command[:, :1] - self.speeds) / 0.075
+    # Choose the target from speed and cycle phase only. The policy cannot pick an easier pose.
+    weights = torch.softmax(22 * similarity - 0.5 * speed_error.square(), dim=-1)
+    reference_q, reference_qd, reference_transfer = (weights @ self.body_samples).split(
+      (q.shape[-1], qd.shape[-1], 6), dim=-1
+    )
+    q_error = ((q - reference_q) / self.pose_widths).square().mean(-1)
+    qd_error = ((qd - reference_qd) / self.rate_widths).square().mean(-1)
+    transfer_error = (
+      (
+        (self._transfer(height, quat, linear_w) - reference_transfer)
+        / self.transfer_widths
+      )
+      .square()
+      .mean(-1)
+    )
+    return forward_gait_gate(command) / (
+      1 + 0.60 * q_error + 0.17 * qd_error + 0.42 * transfer_error
     )
 
 
@@ -178,6 +311,7 @@ class ForwardGaitAdapter(nn.Module):
     scale: torch.Tensor,
     limit_rad: float,
     use_phase: bool = False,
+    full_body: bool = False,
   ) -> None:
     super().__init__()
     joints = (
@@ -199,6 +333,13 @@ class ForwardGaitAdapter(nn.Module):
       ],
       device=scale.device,
     )
+    self.legacy_action_count = len(indices)
+    if full_body:
+      available = set(indices.tolist())
+      added = indices.new_tensor(
+        [i for i in range(len(action_names)) if i not in available]
+      )
+      indices = torch.cat((indices, added))
     self.register_buffer("indices", indices, persistent=False)
     self.register_buffer(
       "limits", limit_rad / scale.reshape(-1)[indices], persistent=False
@@ -210,6 +351,19 @@ class ForwardGaitAdapter(nn.Module):
     nn.init.zeros_(self.net[-1].weight)
     nn.init.zeros_(self.net[-1].bias)
     self.reflection: G1SagittalReflection | None = None
+
+  def expand_checkpoint(self, state: dict[str, torch.Tensor], prefix: str) -> None:
+    """Retain the learned limb corrections when adding torso and wrist outputs."""
+    target = self.net[-1]
+    layer = f"{prefix}net.{len(self.net) - 1}."
+    for name in ("weight", "bias"):
+      key = layer + name
+      old = state[key]
+      current = getattr(target, name)
+      if old.shape[0] == self.legacy_action_count < current.shape[0]:
+        expanded = current.detach().clone()
+        expanded[: self.legacy_action_count] = old
+        state[key] = expanded
 
   def forward(
     self,
@@ -241,21 +395,10 @@ class G1SagittalReflection(nn.Module):
     super().__init__()
     self.blend = blend
     for attr, names in (("joint", tuple(joint_names)), ("action", action_names)):
-      counterparts = []
-      for name in names:
-        if name.startswith("left_"):
-          partner = "right_" + name.removeprefix("left_")
-        elif name.startswith("right_"):
-          partner = "left_" + name.removeprefix("right_")
-        else:
-          partner = name
-        counterparts.append(names.index(partner))
-      signs = scale.new_tensor(
-        [-1 if "_roll_" in name or "_yaw_" in name else 1 for name in names]
-      )
+      counterparts, signs = sagittal_joint_mapping(names, scale)
       self.register_buffer(
         f"{attr}_permutation",
-        torch.tensor(counterparts, device=scale.device),
+        counterparts,
         persistent=False,
       )
       self.register_buffer(f"{attr}_sign", signs, persistent=False)
@@ -295,13 +438,13 @@ class G1SagittalReflection(nn.Module):
 def warm_start_gait_adapter(
   actor: MultiEncoderAE,
   representation: StateRepresentation,
-  motion: MotionLoader,
   prior: ForwardGaitPrior,
   steps: int,
 ) -> None:
   """Imitate the frozen motion branch at compatible speed and phase before rollouts."""
   adapter = actor.forward_gait_adapter
   assert isinstance(adapter, ForwardGaitAdapter) and prior.reference_phase is not None
+  motion = prior.reference_motion
   motion_spec = next(spec for spec in actor.task_specs if spec.name == "motion")
   rows = prior.reference_rows
   with torch.no_grad():

@@ -233,6 +233,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Condition straight walking and its imitation reward on a continuous gait phase."""
   forward_gait_teacher_steps: int = 0
   """Supervised warm-start updates from the frozen full-reference policy."""
+  forward_gait_full_body: bool = False
+  """Track continuous mocap targets and allow corrections to all G1 joints."""
+  forward_gait_demo_files: str | None = None
+  """Comma-separated physical full-reference demonstrations for full-body gait shaping."""
   forward_foot_cycle_weight: float = 0.0
   """Weight for phase-aligned alternation, clearance and placement of the feet."""
   forward_gait_reflection: float = 0.0
@@ -245,6 +249,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Train a bounded non-straight action correction in radians."""
   steering_recovery_weight: float = 0.0
   """Weight of narrow heading-velocity tracking for turning and lateral motion."""
+  train_steering_recovery: bool = True
+  """When a steering adapter is present, update it instead of the walking adapter."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """各任务目标提取、命令范围和平滑窗口等设置。"""
   slot_mix: dict[str, float] = field(
@@ -433,6 +439,7 @@ def build_actor(
     gait_adapter = ForwardGaitAdapter(
       obs_dim, wm.action_names, wm.dynamics.action_scale, cfg.forward_gait_action_limit,
       use_phase=cfg.forward_gait_phase,
+      full_body=cfg.forward_gait_full_body,
     )
     if cfg.forward_gait_reflection:
       if not isinstance(representation, GenCoordRepresentation):
@@ -1071,11 +1078,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         prefix = f"{adapter_name}."
         if getattr(actor, adapter_name) is not None and not any(name.startswith(prefix) for name in state):
           state.update({name: value for name, value in actor.state_dict().items() if name.startswith(prefix)})
+      if self.cfg.forward_gait_full_body:
+        assert isinstance(actor.forward_gait_adapter, ForwardGaitAdapter)
+        actor.forward_gait_adapter.expand_checkpoint(state, "forward_gait_adapter.")
       actor.load_state_dict(state)
     self._velocity_command = None
     if self.cfg.independent_velocity:
       actor.requires_grad_(False)
-      if actor.steering_recovery_adapter is not None:
+      if actor.steering_recovery_adapter is not None and self.cfg.train_steering_recovery:
         actor.steering_recovery_adapter.requires_grad_(True)
       elif actor.forward_gait_adapter is not None:
         actor.forward_gait_adapter.requires_grad_(True)
@@ -1090,7 +1100,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if self.cfg.forward_gait_teacher_steps:
         gait = self.env.unwrapped.reward_manager.get_term_cfg("forward_gait").func
         warm_start_gait_adapter(
-          actor, self._representation, self.motion, gait, self.cfg.forward_gait_teacher_steps
+          actor, self._representation, gait, self.cfg.forward_gait_teacher_steps
         )
     # 只为占有非零批次比例的任务生成目标；编码器仍按配置的任务顺序分配槽位。
     self._active_task_specs = [
