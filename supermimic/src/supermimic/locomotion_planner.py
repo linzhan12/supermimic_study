@@ -166,6 +166,7 @@ class LocomotionPlanner:
     strict_contact: bool = True,
     prediction_steps: int = 10,
     pace_margin: float | None = None,
+    stop_double_support_pose: float | None = None,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -179,6 +180,7 @@ class LocomotionPlanner:
     self.weight = trackability_weight
     self.strict_contact = strict_contact
     self.pace_margin = pace_margin
+    self.stop_double_support_pose = stop_double_support_pose
     self.plan = initial.hold_after(0, self.preview_length)
     self.clip: ReferenceClip | None = None
     self.frame = 0
@@ -329,6 +331,11 @@ class LocomotionPlanner:
         # Permit that difference when both feet remain in support at the join.
         double_support_start = (mode == "start") & common.all(-1)
         pose_limit = torch.where(double_support_start, 0.32, 0.26)
+        if mode == "stop" and self.stop_double_support_pose is not None:
+          settled_support = common.all(-1) & observed_contact.all()
+          pose_limit = torch.where(
+            settled_support, self.stop_double_support_pose, pose_limit
+          )
         compatible = (
           common.any(-1) & (pose_cost.sqrt() < pose_limit) & (foot_cost < 0.04)
         )
