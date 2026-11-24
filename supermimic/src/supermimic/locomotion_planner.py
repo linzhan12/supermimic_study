@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Literal
 
@@ -151,6 +152,7 @@ class ReferenceClip:
   mean_tracking_bias: torch.Tensor
   period_steps: int = 0
   exit_twist: torch.Tensor | None = None
+  lateral_reference_speed: float | None = None
 
   @classmethod
   def load(
@@ -182,6 +184,11 @@ class ReferenceClip:
         if "exit_twist" in data
         else None
       )
+      lateral_speed = (
+        float(data["lateral_reference_speed"].item())
+        if "lateral_reference_speed" in data
+        else None
+      )
     frames = ReferenceWindow(
       arrays["joint_pos"],
       arrays["joint_vel"],
@@ -209,13 +216,29 @@ class ReferenceClip:
         exit_twist is not None
         and (exit_twist.shape != (3,) or not torch.isfinite(exit_twist).all())
       )
+      or (
+        lateral_speed is not None
+        and (
+          mode != "walk"
+          or not period
+          or not isfinite(lateral_speed)
+          or lateral_speed == 0
+        )
+      )
     ):
       raise ValueError(f"{path}: invalid or incomplete motion reference.")
     twist = heading_twist(
       frames.quat, arrays["root_lin_vel_w"], arrays["root_ang_vel_w"]
     )
     return cls(
-      path.stem, mode, frames, twist, arrays["mean_tracking_bias"], period, exit_twist
+      path.stem,
+      mode,
+      frames,
+      twist,
+      arrays["mean_tracking_bias"],
+      period,
+      exit_twist,
+      lateral_speed,
     )
 
 
@@ -286,7 +309,11 @@ class LocomotionPlanner:
     self.committed_steps = self.blend_steps
     self.clip_direction = (
       {
-        clip.name: self._direction(clip.twist.mean(dim=0) + clip.mean_tracking_bias)
+        clip.name: (
+          (1 if clip.lateral_reference_speed > 0 else -1, 0)
+          if clip.lateral_reference_speed is not None
+          else self._direction(clip.twist.mean(dim=0) + clip.mean_tracking_bias)
+        )
         for clip in clips
         if clip.mode == "walk"
       }

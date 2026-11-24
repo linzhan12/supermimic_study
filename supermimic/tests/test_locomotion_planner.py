@@ -141,6 +141,33 @@ def test_measured_cycle_ingress_can_ablate_ranking_without_changing_the_seam():
     torch.testing.assert_close(planner.plan.q[0], measured.q[0], atol=0, rtol=0)
 
 
+def test_declared_diagonal_reference_is_excluded_from_straight_walk():
+  pose = window(120)
+  axial = torch.tensor([0.22, 0.0, 0.0])
+  weak_side = torch.tensor([0.22, 0.08, 0.0])
+  straight = ReferenceClip(
+    "straight", "walk", pose, axial.expand(120, -1), torch.zeros(3), 60
+  )
+  diagonal = ReferenceClip(
+    "diagonal",
+    "walk",
+    pose,
+    weak_side.expand(120, -1),
+    torch.zeros(3),
+    60,
+    lateral_reference_speed=0.08,
+  )
+  planner = LocomotionPlanner(
+    [straight, diagonal], window(1), 0.02, directional_selection=True
+  )
+  planner.update(axial, pose.contact[0])
+  assert [c["clip"] for c in planner.last_costs] == ["straight"]
+  for _ in range(10):
+    planner.advance()
+  planner.update(torch.tensor([0.22, 0.20, 0.0]), pose.contact[0])
+  assert [c["clip"] for c in planner.last_costs] == ["diagonal"]
+
+
 def test_cycle_ingress_can_blend_legs_before_a_larger_upper_body_change():
   measured = window(1)
   motion = window(120, 0.45)

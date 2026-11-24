@@ -42,6 +42,8 @@ def pack(
     }
     if "period_steps" in source:
       arrays["period_steps"] = source["period_steps"]
+    if "lateral_reference_speed" in source:
+      arrays["lateral_reference_speed"] = source["lateral_reference_speed"]
   reference = [
     {
       "pelvis_position_w_m": p,
