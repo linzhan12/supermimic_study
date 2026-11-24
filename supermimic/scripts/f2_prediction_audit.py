@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from supermimic.contact_tracking import ContactTrackingAdapter
 from supermimic.locomotion_planner import (
   PREVIEW_STEPS,
   LocomotionPlanner,
@@ -18,10 +19,19 @@ WINDOW_FIELDS = ("q", "qd", "p", "quat", "feet", "contact")
 
 
 class PredictionAudit:
-  def __init__(self, stride: int, dt: float, heading_strength: float) -> None:
+  def __init__(
+    self,
+    stride: int,
+    dt: float,
+    heading_strength: float,
+    adapter: ContactTrackingAdapter | None,
+    adapter_gain: float,
+  ) -> None:
     self.stride = stride
     self.dt = dt
     self.heading_strength = heading_strength
+    self.adapter = adapter
+    self.adapter_gain = adapter_gain
     self.previous_plan = None
     self.revision = -1
     self.steps: list[dict] = []
@@ -42,6 +52,7 @@ class PredictionAudit:
     next_state: torch.Tensor,
     next_aux: torch.Tensor,
     next_contact: torch.Tensor,
+    adapted: bool,
   ) -> None:
     if self.previous_plan is not planner.plan:
       self.previous_plan = planner.plan
@@ -68,6 +79,7 @@ class PredictionAudit:
         **{key: value.detach().cpu().clone() for key, value in row.items()},
         "phase": phase,
         "reference_revision": self.revision,
+        "adapted": adapted,
       }
     )
 
@@ -140,6 +152,10 @@ class PredictionAudit:
           dt=self.dt,
           yaw_rate=float(cmd[2]) if self.heading_strength else 0.0,
           heading_strength=self.heading_strength,
+          adapter=self.adapter if self.steps[start]["adapted"] else None,
+          command=cmd,
+          measured_contact=fields["contact"][start : start + 1].to(device),
+          adapter_gain=self.adapter_gain,
         )
       )
       torch.testing.assert_close(receding[0][2], actions[:1], rtol=1e-5, atol=1e-6)

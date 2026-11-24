@@ -77,27 +77,55 @@ class ReferenceWindow:
     """Use the original 10-frame layout with relative root orientation."""
     offsets = GOAL_FRAME_STRIDE * torch.arange(NUM_GOAL_FRAMES, device=self.q.device)
     index = steps[..., None] + offsets
-    orientation_w = self.quat[index]
-    if heading_strength and abs(yaw_rate) > 0.16:
-      # Guide the heading from the observed root. Tilt and every joint target
-      # stay in the original reference, and the yaw correction is bounded.
-      advance = (offsets * dt + 0.12) * (0.5 * yaw_rate)
-      zero = torch.zeros_like(advance)
-      increment = torch.stack((advance.cos(), zero, zero, advance.sin()), dim=-1)
-      anchor = yaw_quat(aux[:, 3:])[:, None].expand_as(orientation_w)
-      ideal = quat_mul(anchor, increment[None].expand_as(orientation_w))
-      delta = quat_mul(ideal, quat_conjugate(yaw_quat(orientation_w)))
-      angle = 2 * torch.atan2(delta[..., 3], delta[..., 0])
-      bounded = torch.atan2(angle.sin(), angle.cos()).clamp(-0.24, 0.24)
-      half = 0.5 * heading_strength * bounded
-      zero = torch.zeros_like(half)
-      correction = torch.stack((half.cos(), zero, zero, half.sin()), dim=-1)
-      orientation_w = quat_mul(correction, orientation_w)
-    _, orientation = assemble_anchor_window(
-      aux[..., :3], aux[..., 3:], self.p[index], orientation_w
+    return reference_actor_goal(
+      self.q[index],
+      self.qd[index],
+      self.p[index],
+      self.quat[index],
+      aux,
+      offsets,
+      yaw_rate=yaw_rate,
+      heading_strength=heading_strength,
+      dt=dt,
     )
-    content = torch.cat((self.q[index], self.qd[index]), dim=-1).flatten(start_dim=1)
-    return torch.cat((content, orientation), dim=-1)
+
+
+def reference_actor_goal(
+  q: torch.Tensor,
+  qd: torch.Tensor,
+  p: torch.Tensor,
+  orientation_w: torch.Tensor,
+  aux: torch.Tensor,
+  offsets: torch.Tensor,
+  *,
+  yaw_rate: float | torch.Tensor,
+  heading_strength: float | torch.Tensor,
+  dt: float,
+) -> torch.Tensor:
+  """Assemble motion goals for single previews or independently sampled batches."""
+  guided = isinstance(yaw_rate, torch.Tensor) or abs(yaw_rate) > 0.16
+  if guided and (isinstance(heading_strength, torch.Tensor) or heading_strength):
+    # The correction is applied in yaw while preserving full-body joint targets.
+    advance = (offsets * dt + 0.12) * (0.5 * yaw_rate)
+    zero = torch.zeros_like(advance)
+    increment = torch.stack((advance.cos(), zero, zero, advance.sin()), dim=-1)
+    anchor = yaw_quat(aux[:, 3:])[:, None].expand_as(orientation_w)
+    ideal = quat_mul(anchor, increment.expand_as(orientation_w))
+    delta = quat_mul(ideal, quat_conjugate(yaw_quat(orientation_w.contiguous())))
+    angle = 2 * torch.atan2(delta[..., 3], delta[..., 0])
+    bounded = torch.atan2(angle.sin(), angle.cos()).clamp(-0.24, 0.24)
+    half = 0.5 * heading_strength * bounded
+    zero = torch.zeros_like(half)
+    correction = torch.stack((half.cos(), zero, zero, half.sin()), dim=-1)
+    steered = quat_mul(correction, orientation_w)
+    orientation_w = (
+      torch.where(yaw_rate.abs()[..., None] > 0.16, steered, orientation_w)
+      if isinstance(yaw_rate, torch.Tensor)
+      else steered
+    )
+  _, orientation = assemble_anchor_window(aux[..., :3], aux[..., 3:], p, orientation_w)
+  content = torch.cat((q, qd), dim=-1).flatten(start_dim=1)
+  return torch.cat((content, orientation), dim=-1)
 
 
 @dataclass(frozen=True)

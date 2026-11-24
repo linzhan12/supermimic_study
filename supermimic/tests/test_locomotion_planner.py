@@ -1,10 +1,12 @@
 import torch
 
+from supermimic.contact_tracking import JOINTS, ContactTrackingAdapter
 from supermimic.locomotion_planner import (
   PREVIEW_STEPS,
   LocomotionPlanner,
   ReferenceClip,
   ReferenceWindow,
+  reference_actor_goal,
 )
 from supermimic.reference_trackability import projected_twist
 from supermimic.representations import (
@@ -264,6 +266,53 @@ def test_heading_guide_preserves_joint_goals_and_is_inactive_for_straight_comman
   torch.testing.assert_close(
     reference.actor_goal(steps, aux, heading_strength=0.58), plain, atol=0, rtol=0
   )
+
+
+def test_batched_reference_goals_match_execution_for_mixed_yaw_commands():
+  ref = window(PREVIEW_STEPS)
+  offsets = GOAL_FRAME_STRIDE * torch.arange(NUM_GOAL_FRAMES)
+  aux = torch.cat((ref.p[0], ref.quat[0]))[None].expand(2, -1)
+  expected = torch.cat(
+    [
+      ref.actor_goal(
+        torch.zeros(1, dtype=torch.long),
+        aux[i : i + 1],
+        yaw_rate=yaw,
+        heading_strength=0.58,
+      )
+      for i, yaw in enumerate((0.0, -0.4))
+    ]
+  )
+  batch = reference_actor_goal(
+    *(x[offsets][None].expand(2, -1, -1) for x in (ref.q, ref.qd, ref.p, ref.quat)),
+    aux,
+    offsets,
+    yaw_rate=torch.tensor([[0.0], [-0.4]]),
+    heading_strength=torch.full((2, 1), 0.58),
+    dt=0.02,
+  )
+  torch.testing.assert_close(batch, expected, rtol=0, atol=2e-7)
+
+
+def test_contact_adapter_preserves_unselected_actions_and_bounds_physical_radians():
+  names = (*JOINTS, "left_knee_joint", "left_elbow_joint")
+  action_names = tuple(reversed(names))
+  scale = torch.linspace(0.2, 0.6, len(names))
+  adapter = ContactTrackingAdapter(names, action_names, scale, 0.06)
+  original = torch.ones(1, len(names))
+  state = torch.zeros(1, 10 + 2 * len(names))
+  aux = torch.tensor([[0.0, 0.0, 0.78, 1.0, 0.0, 0.0, 0.0]])
+  command, q = torch.zeros(1, 3), torch.zeros(1, len(names))
+  contact = torch.ones(1, 2, dtype=torch.bool)
+  inputs = (original, state, aux, command, q, q, contact, contact)
+  unchanged, _ = adapter(*inputs)
+  torch.testing.assert_close(unchanged, original, rtol=0, atol=0)
+  with torch.no_grad():
+    adapter.head[-1].bias.fill_(100)
+  out, delta = adapter(*inputs, gain=0.5)
+  torch.testing.assert_close(out[:, :2], original[:, :2], rtol=0, atol=0)
+  torch.testing.assert_close((out - original)[:, 2:] * scale[2:], delta)
+  assert bool((delta.abs() <= 0.03).all())
 
 
 def test_generated_step_allows_next_direction_when_feet_return_to_rest():

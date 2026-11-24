@@ -22,6 +22,7 @@ from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionLoader
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
+from supermimic.contact_tracking import ContactTrackingAdapter
 from supermimic.locomotion_planner import (
   LocomotionPlanner,
   ReferenceClip,
@@ -92,6 +93,11 @@ class Config:
   trackability_weight: float = 0.0
   prediction_steps: int = 10
   prediction_audit_stride: int = 0
+  fixed_plan_dir: Path | None = None
+  contact_adapter: Path | None = None
+  adapter_gain: float = 1.0
+  adapt_ranking: bool = False
+  adapter_probe_phases: tuple[str, ...] = ()
   pace_margin: float | None = None
   stop_double_support_pose: float | None = None
   contact_stop_duration: float | None = None
@@ -209,6 +215,35 @@ def summarize(trace: list[dict], planned_steps: int, dt: float) -> dict:
   }
 
 
+def make_eval_env(cfg: Config, task_id: str) -> ManagerBasedRlEnv:
+  env_cfg = load_env_cfg(task_id, play=True)
+  env_cfg.seed = cfg.seed
+  env_cfg.scene.num_envs = 1
+  env_cfg.auto_reset = False
+  env_cfg.observations["actor"].enable_corruption = False
+  env_cfg.commands["motion"].motion_file = str(cfg.motion_file.resolve())
+  env_cfg.commands["motion"].joint_position_range = (0.0, 0.0)
+  env_cfg.terminations = {
+    "pelvis_low": TerminationTermCfg(
+      func=mdp.root_height_below_minimum, params={"minimum_height": FALL_HEIGHT_M}
+    ),
+    "pelvis_tilt": TerminationTermCfg(
+      func=mdp.bad_orientation, params={"limit_angle": FALL_TILT_RAD}
+    ),
+  }
+  env_cfg.scene.sensors = (
+    *env_cfg.scene.sensors,
+    ContactSensorCfg(
+      name="p0_feet_ground",
+      primary=ContactMatch("subtree", r"^(left|right)_ankle_roll_link$", "robot"),
+      secondary=ContactMatch("body", "terrain"),
+      fields=("found",),
+      reduce="netforce",
+    ),
+  )
+  return ManagerBasedRlEnv(cfg=env_cfg, device=cfg.device)
+
+
 @torch.no_grad()
 def evaluate(cfg: Config) -> None:
   if cfg.seed < 0:
@@ -250,6 +285,22 @@ def evaluate(cfg: Config) -> None:
   ):
     raise ValueError(
       "The prediction audit requires a reference bank and a positive stride."
+    )
+  if cfg.contact_adapter is not None and cfg.reference_bank is None:
+    raise ValueError("The contact adapter is only supported on the planned route.")
+  if not 0.0 <= cfg.adapter_gain <= 1.0:
+    raise ValueError("The contact adapter gain must be between zero and one.")
+  if cfg.adapt_ranking and (not cfg.trackability_weight or cfg.contact_adapter is None):
+    raise ValueError("Adapted ranking needs a contact adapter and world-model ranking.")
+  if cfg.fixed_plan_dir is not None and (
+    cfg.reference_bank is None or cfg.adapt_ranking
+  ):
+    raise ValueError("Fixed tape playback needs a reference bank and skips ranking.")
+  if cfg.adapter_probe_phases and (
+    cfg.fixed_plan_dir is None or cfg.contact_adapter is None
+  ):
+    raise ValueError(
+      "Phase-restricted adapter probes need both a fixed tape and an adapter."
     )
   if cfg.motion_only and cfg.reference_bank is not None:
     raise ValueError("Fixed-reference and planned evaluations are separate modes.")
@@ -343,32 +394,7 @@ def evaluate(cfg: Config) -> None:
   if velocity_obs_count == 0:
     raise ValueError("Choose a checkpoint with collected velocity goal statistics.")
 
-  env_cfg = load_env_cfg(task_id, play=True)
-  env_cfg.seed = cfg.seed
-  env_cfg.scene.num_envs = 1
-  env_cfg.auto_reset = False
-  env_cfg.observations["actor"].enable_corruption = False
-  env_cfg.commands["motion"].motion_file = str(cfg.motion_file.resolve())
-  env_cfg.commands["motion"].joint_position_range = (0.0, 0.0)
-  env_cfg.terminations = {
-    "pelvis_low": TerminationTermCfg(
-      func=mdp.root_height_below_minimum, params={"minimum_height": FALL_HEIGHT_M}
-    ),
-    "pelvis_tilt": TerminationTermCfg(
-      func=mdp.bad_orientation, params={"limit_angle": FALL_TILT_RAD}
-    ),
-  }
-  env_cfg.scene.sensors = (
-    *env_cfg.scene.sensors,
-    ContactSensorCfg(
-      name="p0_feet_ground",
-      primary=ContactMatch("subtree", r"^(left|right)_ankle_roll_link$", "robot"),
-      secondary=ContactMatch("body", "terrain"),
-      fields=("found",),
-      reduce="netforce",
-    ),
-  )
-  sim_env = ManagerBasedRlEnv(cfg=env_cfg, device=cfg.device)
+  sim_env = make_eval_env(cfg, task_id)
   try:
     env = RslRlVecEnvWrapper(sim_env)
     wm = build_world_model(runner_cfg, env, cfg.device)
@@ -430,6 +456,28 @@ def evaluate(cfg: Config) -> None:
         torch.load(dynamics_path, map_location=cfg.device, weights_only=True)
       )
       wm.dynamics.eval()
+    adapter = None
+    if cfg.contact_adapter is not None:
+      trained = torch.load(
+        cfg.contact_adapter, map_location=cfg.device, weights_only=True
+      )
+      if (
+        runner_cfg.representation != "gencoord"
+        or trained["actor_sha256"] != sha256(actor_path)
+        or trained["world_model_sha256"] != sha256(dynamics_path)
+        or not math.isclose(trained["dt"], dt)
+      ):
+        raise ValueError(
+          "The adapter and the frozen F2 models or control interval differ."
+        )
+      adapter = ContactTrackingAdapter(
+        tuple(robot.joint_names),
+        tuple(sim_env.action_manager.get_term("joint_pos").target_names),
+        wm.dynamics.action_scale,
+        trained["limit_rad"],
+      ).to(cfg.device)
+      adapter.load_state_dict(trained["adapter"])
+      adapter.eval()
     sim_ctx = wm.sim_context.read(sim_env)
     env_ids = torch.zeros(1, dtype=torch.long, device=cfg.device)
     scenarios = {}
@@ -473,6 +521,12 @@ def evaluate(cfg: Config) -> None:
       if frame < 0 or frame + len(schedule) >= len(ref_raw):
         raise ValueError(f"{case} requires {len(schedule)} steps after frame {frame}.")
       scenarios[case] = (frame, schedule)
+    if cfg.adapter_probe_phases:
+      available = {phase for _, schedule in scenarios.values() for phase, _ in schedule}
+      if set(cfg.adapter_probe_phases) - available:
+        raise ValueError(
+          "An adapter probe phase is absent from the selected schedules."
+        )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=False)
     summary = {
@@ -532,6 +586,15 @@ def evaluate(cfg: Config) -> None:
       }
       if cfg.prediction_audit_stride:
         summary["planning"]["prediction_audit_stride"] = cfg.prediction_audit_stride
+      if cfg.fixed_plan_dir is not None:
+        summary["planning"]["fixed_plan_dir"] = str(cfg.fixed_plan_dir.resolve())
+      if cfg.contact_adapter is not None:
+        summary["planning"].update(
+          contact_adapter_sha256=sha256(cfg.contact_adapter),
+          adapter_gain=cfg.adapter_gain,
+          adapt_ranking=cfg.adapt_ranking,
+          adapter_probe_phases=cfg.adapter_probe_phases,
+        )
     for case, (frame, schedule) in scenarios.items():
       initial = None
       case_summary = {"reference_frame": frame, "routes": {}}
@@ -566,6 +629,8 @@ def evaluate(cfg: Config) -> None:
         trace = []
         planner = None
         audit = None
+        tape = None
+        moved = False
         if route == "planned":
           assert feet.data.found is not None
           initial_window = ReferenceWindow(
@@ -599,8 +664,43 @@ def evaluate(cfg: Config) -> None:
             planner.mode = "walk"
           if cfg.prediction_audit_stride:
             audit = PredictionAudit(
-              cfg.prediction_audit_stride, dt, cfg.heading_strength
+              cfg.prediction_audit_stride,
+              dt,
+              cfg.heading_strength,
+              adapter,
+              cfg.adapter_gain,
             )
+          if cfg.fixed_plan_dir is not None:
+            tape_path = cfg.fixed_plan_dir / f"{case}_prediction.pt"
+            tape = torch.load(tape_path, map_location=cfg.device, weights_only=True)
+            if (
+              tape["window_steps"] != list(range(len(schedule)))
+              or not math.isclose(tape["dt"], dt)
+              or not math.isclose(tape["heading_strength"], cfg.heading_strength)
+              or tape["phase"] != [phase for phase, _ in schedule]
+            ):
+              raise ValueError(
+                f"{tape_path}: need a full stride-1 capture of this schedule."
+              )
+            torch.testing.assert_close(
+              tape["command"],
+              torch.stack([command for _, command in schedule]),
+              atol=0,
+              rtol=0,
+            )
+            torch.testing.assert_close(
+              tape["aux"][:1],
+              wm.representation.extract_aux_state(obs["full_state"]),
+              atol=0,
+              rtol=0,
+            )
+            torch.testing.assert_close(
+              tape["state"][:1],
+              wm.representation.represent(obs["full_state"]),
+              atol=0,
+              rtol=0,
+            )
+            case_summary["fixed_reference_sha256"] = sha256(tape_path)
         for step, (phase, scripted_target) in enumerate(schedule):
           ref_frame = int(motion_cmd.time_steps[0])
           if route in ("scripted_velocity", "planned"):
@@ -619,9 +719,16 @@ def evaluate(cfg: Config) -> None:
             else torch.cat((history[:, 1:], sensor), dim=1)
           )
           preview = None
+          adapt_here = False
           if planner is not None:
             assert feet.data.found is not None
             aux = wm.representation.extract_aux_state(obs["full_state"])
+            contact = feet.data.found > 0
+            if adapter is not None:
+              moved |= bool(target.abs().max() > 0.025)
+              adapt_here = moved and (
+                not cfg.adapter_probe_phases or phase in cfg.adapter_probe_phases
+              )
             pure_forward = cfg.axial_cycle_ranking and bool(
               (target[0] > 0.025) & (target[1:].abs().max() < 0.025)
             )
@@ -642,8 +749,10 @@ def evaluate(cfg: Config) -> None:
               else cfg.command_cost_weight,
               dt=dt,
               heading_strength=cfg.heading_strength,
+              adapter=adapter if adapt_here and cfg.adapt_ranking else None,
+              measured_contact=contact,
+              adapter_gain=cfg.adapter_gain,
             )
-            contact = feet.data.found > 0
             stop_fallback = None
             contact_launch = None
             measured = None
@@ -683,15 +792,23 @@ def evaluate(cfg: Config) -> None:
               if cfg.restart_from_rest
               else None
             )
-            planner.update(
-              target,
-              contact[0],
-              score,
-              stop_fallback=stop_fallback,
-              observed_twist=measured_twist,
-              contact_launch=contact_launch,
-              measured_steering_anchor=measured if cfg.steering_measured_seam else None,
-            )
+            if tape is None:
+              planner.update(
+                target,
+                contact[0],
+                score,
+                stop_fallback=stop_fallback,
+                observed_twist=measured_twist,
+                contact_launch=contact_launch,
+                measured_steering_anchor=measured
+                if cfg.steering_measured_seam
+                else None,
+              )
+            else:
+              planner.plan = ReferenceWindow(
+                **{key: frames[step] for key, frames in tape["windows"].items()}
+              )
+              planner.offset = 0
             preview = planner.preview()
             goal = preview.actor_goal(
               torch.zeros_like(env_ids),
@@ -708,6 +825,19 @@ def evaluate(cfg: Config) -> None:
           reference_q = motion_cmd.motion.joint_pos[ref_frame]
           actor_obs = build_actor_obs_td({task: goal}, history)
           action = actor(actor_obs)
+          adjustment = None
+          if preview is not None and adapter is not None and adapt_here:
+            action, adjustment = adapter(
+              action,
+              state,
+              aux,
+              target[None],
+              preview.q[1:2],
+              preview.qd[1:2],
+              contact,
+              preview.contact[:1],
+              cfg.adapter_gain,
+            )
           if audit is not None:
             before_aux = aux.clone()
           obs, reward, terminated, truncated, _ = sim_env.step(action)
@@ -726,6 +856,7 @@ def evaluate(cfg: Config) -> None:
               wm.representation.represent(obs["full_state"]),
               wm.representation.extract_aux_state(obs["full_state"]),
               feet.data.found > 0,
+              adapt_here,
             )
           actual = heading_twist(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w
@@ -762,6 +893,8 @@ def evaluate(cfg: Config) -> None:
             "legacy_tracking_reward": reward[0].item(),
             "termination_reasons": reasons,
           }
+          if adjustment is not None:
+            row["contact_adjustment_rad"] = adjustment[0].tolist()
           if preview is not None and planner is not None:
             source = planner.clip
             row.update(

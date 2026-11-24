@@ -6,6 +6,7 @@ from itertools import chain
 import torch
 from mjlab.utils.lab_api.math import quat_conjugate, quat_mul, yaw_quat
 
+from supermimic.contact_tracking import ContactTrackingAdapter
 from supermimic.locomotion_planner import PREVIEW_STEPS, ReferenceWindow, heading_twist
 from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.representations import StateRepresentation
@@ -37,6 +38,10 @@ def tracking_steps(
   dt: float,
   yaw_rate: float,
   heading_strength: float,
+  adapter: ContactTrackingAdapter | None = None,
+  command: torch.Tensor | None = None,
+  measured_contact: torch.Tensor | None = None,
+  adapter_gain: float = 1.0,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
   """Yield predicted root poses, joint states and actions in control order."""
   count = len(windows)
@@ -59,6 +64,20 @@ def tracking_steps(
       ]
     )
     action = actor(build_actor_obs_td({"motion": goals}, history))
+    if adapter is not None:
+      assert command is not None and measured_contact is not None
+      support = torch.stack([window.contact[index] for window in windows])
+      action, _ = adapter(
+        action,
+        state,
+        aux,
+        command.expand(count, -1),
+        torch.stack([window.q[index + 1] for window in windows]),
+        torch.stack([window.qd[index + 1] for window in windows]),
+        measured_contact.expand_as(support) if index == 0 else support,
+        support,
+        adapter_gain,
+      )
     aux, state = dynamics(state, action, aux, context)
     joints = representation.joint_state(state)
     yield aux, joints, action
@@ -84,6 +103,9 @@ def predict_tracking_cost(
   command_weight: float = 0.0,
   dt: float = 0.02,
   heading_strength: float = 0.0,
+  adapter: ContactTrackingAdapter | None = None,
+  measured_contact: torch.Tensor | None = None,
+  adapter_gain: float = 1.0,
 ) -> torch.Tensor:
   """Roll out the same motion actor that will execute the proposed reference.
 
@@ -106,6 +128,10 @@ def predict_tracking_cost(
     dt=dt,
     yaw_rate=yaw_rate,
     heading_strength=heading_strength,
+    adapter=adapter,
+    command=command,
+    measured_contact=measured_contact,
+    adapter_gain=adapter_gain,
   )
   # The generator checks for a complete preview before the first model step.
   first = next(rollout)
