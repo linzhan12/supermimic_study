@@ -91,6 +91,7 @@ class StanceBridge:
     duration: float,
     foot_speed: torch.Tensor,
     lean: float = 0.0,
+    forward_lead: float = 0.0,
   ) -> ReferenceWindow | None:
     """Shift weight and step toward the requested diagonal using the measured feet."""
     if not bool(initial.contact.all()) or bool((foot_speed > 0.25).any()):
@@ -114,6 +115,16 @@ class StanceBridge:
     feet[:, swing] += travel[:, None] * world
     feet[:, swing, 2] += 0.055 * np.sin(np.pi * phase) ** 2
     p = p0 + (0.5 * travel[:, None]) * world
+    if forward_lead:
+      forward = (
+        quat_apply(yaw_quat(initial.quat[0]), command.new_tensor((1.0, 0.0, 0.0)))
+        .cpu()
+        .double()
+        .numpy()
+      )
+      load = np.clip(clock / 0.39, 0, 1)
+      load = load**3 * (10 - 15 * load + 6 * load**2)
+      p += forward_lead * (load - travel)[:, None] * forward
     toward = anchors[support, :2] - anchors[:, :2].mean(0)
     p[:, :2] += 0.30 * shift[:, None] * toward
     p[:, 2] -= 0.018 * shift
@@ -154,6 +165,7 @@ class StanceBridge:
     foot_speed: torch.Tensor,
     lean: float,
     with_alternatives: bool,
+    forward_lead: float = 0.0,
   ) -> list[tuple[str, ReferenceWindow]]:
     timings = [(duration, lean)]
     if with_alternatives:
@@ -165,7 +177,7 @@ class StanceBridge:
       )
     result = []
     for span, tilt in dict.fromkeys(timings):
-      window = self.launch(initial, command, span, foot_speed, tilt)
+      window = self.launch(initial, command, span, foot_speed, tilt, forward_lead)
       if window is not None:
         result.append((f"contact-launch-{span:.2f}-{tilt:.2f}", window))
     return result
