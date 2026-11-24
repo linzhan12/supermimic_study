@@ -99,6 +99,7 @@ class Config:
   direct_steering_start: bool = False
   command_cost_weight: float = 0.0
   candidate_entries: int = 1
+  start_search_time: float | None = None
   strict_contact: bool = True
 
 
@@ -245,6 +246,8 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Command cost requires world-model ranking.")
   if not 1 <= cfg.candidate_entries <= 4:
     raise ValueError("Choose one to four entry phases per reference.")
+  if cfg.start_search_time is not None and not 0.0 < cfg.start_search_time <= 1.0:
+    raise ValueError("The start search window must be between zero and one second.")
   if not 1 <= cfg.prediction_steps <= 30:
     raise ValueError("Choose 1–30 world-model prediction steps.")
   if cfg.pace_margin is not None and (
@@ -460,6 +463,7 @@ def evaluate(cfg: Config) -> None:
         "direct_steering_start": cfg.direct_steering_start,
         "command_cost_weight": cfg.command_cost_weight,
         "candidate_entries": cfg.candidate_entries,
+        "start_search_time": cfg.start_search_time,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -521,6 +525,7 @@ def evaluate(cfg: Config) -> None:
             directional_selection=cfg.directional_selection,
             direct_steering_start=cfg.direct_steering_start,
             candidate_entries=cfg.candidate_entries,
+            start_search_time=cfg.start_search_time,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"

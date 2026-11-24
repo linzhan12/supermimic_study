@@ -173,6 +173,7 @@ class LocomotionPlanner:
     directional_selection: bool = False,
     direct_steering_start: bool = False,
     candidate_entries: int = 1,
+    start_search_time: float | None = None,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -185,6 +186,7 @@ class LocomotionPlanner:
     self.directional_selection = directional_selection
     self.direct_steering_start = direct_steering_start
     self.candidate_entries = candidate_entries
+    self.start_search_time = start_search_time
     self.committed_steps = self.blend_steps
     self.clip_direction = (
       {
@@ -267,7 +269,12 @@ class LocomotionPlanner:
     )
     if direct_start:
       mode = "walk"
-    candidates = self._candidates(mode, observed_contact, direction, direct_start)
+    start_goal = (
+      command if mode == "start" and self.start_search_time is not None else None
+    )
+    candidates = self._candidates(
+      mode, observed_contact, direction, direct_start, start_goal
+    )
     if not candidates and mode == "start":
       mode = "walk"
       candidates = self._candidates(mode, observed_contact, direction)
@@ -340,6 +347,7 @@ class LocomotionPlanner:
     observed_contact: torch.Tensor,
     direction: tuple[int, int] | None = None,
     direct_start: bool = False,
+    start_goal: torch.Tensor | None = None,
   ) -> list[_Candidate]:
     old = self.plan.hold_after(self.offset, self.blend_steps + 1)
     old_support = old.contact[0] if old.contact[0].any() else observed_contact
@@ -359,7 +367,8 @@ class LocomotionPlanner:
       entries = min(last_entry + 1, clip.period_steps or last_entry + 1)
       indices = torch.arange(entries, device=frames.q.device)
       if mode == "start":
-        indices = indices[: max(1, round(0.28 / self.dt))]
+        horizon = self.start_search_time if self.start_search_time is not None else 0.28
+        indices = indices[: max(1, round(horizon / self.dt))]
       if mode == "stop":
         indices = indices[: max(1, round(0.80 / self.dt))]
       if clip is self.clip and continued <= last_entry and mode == "walk":
@@ -380,12 +389,13 @@ class LocomotionPlanner:
         pace = clip.twist[: clip.period_steps].mean(dim=0, keepdim=True)
       else:
         pace_steps = max(2, round(0.72 / self.dt))
-        at = (indices[:, None] + torch.arange(pace_steps, device=indices.device)).clamp(
-          max=len(frames.q) - 1
-        )
+        delay = round(0.24 / self.dt) if start_goal is not None else 0
+        at = (
+          indices[:, None] + delay + torch.arange(pace_steps, device=indices.device)
+        ).clamp(max=len(frames.q) - 1)
         pace = clip.twist[at].mean(dim=1)
       pace = pace + clip.mean_tracking_bias
-      target = self.filtered_command
+      target = self.filtered_command if start_goal is None else start_goal
       if mode == "stop":
         target = target * 0.6
       pace_cost = (
