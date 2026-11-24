@@ -151,6 +151,18 @@ def metrics(
     )
     if a != b and later > earlier
   ]
+  # Use measured same-side touchdowns that bracket an opposite-side landing.
+  # The segment's first heading is fixed to expose course drift.
+  cycle_drift = []
+  for i, (end, side) in enumerate(touchdown_events):
+    previous = [j for j, (_, s) in enumerate(touchdown_events[:i]) if s == side]
+    if not previous:
+      continue
+    j = previous[-1]
+    start = touchdown_events[j][0]
+    if end > start and any(s != side for _, s in touchdown_events[j + 1 : i]):
+      lateral_delta = (pelvis[end, :2] - pelvis[start, :2]) @ leftward[0]
+      cycle_drift.append(float(lateral_delta / ((end - start) * dt)))
   joints = {
     part: q[:, [names.index(f"{side}_{part}_joint") for side in SIDES]]
     for part in ("hip_pitch", "knee", "ankle_pitch", "shoulder_pitch", "elbow")
@@ -184,6 +196,8 @@ def metrics(
     "double_support_fraction": float(contact.all(axis=1).mean()),
     "no_support_fraction": float((~contact.any(axis=1)).mean()),
     "alternating_touchdown_interval_s": [n * dt for n in alternating],
+    "ground_lateral_displacement_m": float(travel @ leftward[0]),
+    "ground_lateral_drift_per_cycle_mps": cycle_drift,
     "excursion_p95_minus_p05_deg": {
       part: np.rad2deg(
         np.quantile(angle, 0.95, axis=0) - np.quantile(angle, 0.05, axis=0)
