@@ -59,6 +59,8 @@ def pack(
   actual = np.asarray([row["actual_velocity"] for row in rows])
   expected = np.asarray([row["reference_velocity_unclipped"] for row in rows])
   bias = (actual - expected).mean(0) if mode == "walk" else np.zeros(3)
+  if mode == "start":
+    arrays["exit_twist"] = actual[-max(1, round(0.4 / dt)) :].mean(0)
   with output.open("xb") as stream:
     np.savez_compressed(
       stream,

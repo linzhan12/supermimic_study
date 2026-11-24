@@ -21,7 +21,11 @@ def rolling_mean(signal: np.ndarray, frames: int) -> np.ndarray:
 
 
 def nominate(
-  path: Path, model: mujoco.MjModel, frames: int, count: int
+  path: Path,
+  model: mujoco.MjModel,
+  frames: int,
+  count: int,
+  directional_transitions: bool = False,
 ) -> dict[str, list[dict]]:
   with np.load(path) as data:
     q, p, quat = (data[key] for key in ("joint_pos", "root_pos_w", "root_quat_w"))
@@ -47,7 +51,8 @@ def nominate(
   mean_forward = np.sum(displacement * forward[:-frames], axis=1)
   mean_left = np.sum(displacement * left[:-frames], axis=1)
   mean_yaw = wrap(yaw[frames:] - yaw[:-frames]) / (frames * dt)
-  speed = np.sum(np.gradient(p[:, :2], dt, axis=0) * forward, axis=1)
+  velocity_w = np.gradient(p[:, :2], dt, axis=0)
+  speed = np.sum(velocity_w * forward, axis=1)
   tilt = np.rad2deg(2 * np.arctan2(np.hypot(x, y), np.hypot(w, z)))
   knees = np.rad2deg(
     q[:, [joint_names.index(f"{side}_knee_joint") for side in ("left", "right")]]
@@ -96,6 +101,38 @@ def nominate(
     + (1 - end_support)
     + abs(start_speed - 0.28) / 0.10
   )
+  if directional_transitions:
+    lateral = np.sum(velocity_w * left, axis=1)
+    angular = np.gradient(yaw, dt)
+    twist = np.column_stack((speed, lateral, angular))
+    prefix_twist = np.stack(
+      [rolling_mean(axis, boundary)[index] for axis in twist.T], axis=1
+    )
+    suffix_twist = np.stack(
+      [rolling_mean(axis, boundary)[index + frames - boundary] for axis in twist.T],
+      axis=1,
+    )
+    rest_speed = np.sqrt(speed**2 + lateral**2 + (0.15 * angular) ** 2)
+    rest = rolling_mean(rest_speed, boundary)[index]
+    for label, goal in (
+      ("start_left", (0.25, 0.20, 0.0)),
+      ("start_right", (0.25, -0.20, 0.0)),
+      ("start_turn_left", (0.35, 0.0, 0.4)),
+      ("start_turn_right", (0.35, 0.0, -0.4)),
+    ):
+      error = (suffix_twist - goal) / (0.10, 0.09, 0.24)
+      scores[label] = (
+        pose_cost + rest / 0.035 + (1 - start_support) + np.linalg.norm(error, axis=1)
+      )
+    for label, goal in (
+      ("stop_left", (0.25, 0.20, 0.0)),
+      ("stop_right", (0.25, -0.20, 0.0)),
+    ):
+      error = (prefix_twist - goal) / (0.10, 0.09, 0.24)
+      terminal = rolling_mean(rest_speed, boundary)[index + frames - boundary]
+      scores[label] = (
+        pose_cost + terminal / 0.035 + (1 - end_support) + np.linalg.norm(error, axis=1)
+      )
   result = {}
   for label, score in scores.items():
     ranked = []
@@ -115,6 +152,9 @@ def nominate(
           "suffix_abs_vx": float(end_speed[frame]),
         }
       )
+      if directional_transitions:
+        ranked[-1]["prefix_twist"] = prefix_twist[frame].tolist()
+        ranked[-1]["suffix_twist"] = suffix_twist[frame].tolist()
       if len(ranked) == count:
         break
     result[label] = ranked
@@ -126,6 +166,7 @@ def main() -> None:
   parser.add_argument("--motions", nargs="+", type=Path, required=True)
   parser.add_argument("--seconds", type=float, default=3.0)
   parser.add_argument("--count", type=int, default=2)
+  parser.add_argument("--directional-transitions", action="store_true")
   args = parser.parse_args()
   if not np.isfinite(args.seconds) or args.seconds < 0.2 or args.count < 1:
     parser.error(
@@ -135,7 +176,12 @@ def main() -> None:
   frames = round(args.seconds * 50)
   print(
     json.dumps(
-      {path.stem: nominate(path, model, frames, args.count) for path in args.motions},
+      {
+        path.stem: nominate(
+          path, model, frames, args.count, args.directional_transitions
+        )
+        for path in args.motions
+      },
       indent=2,
       allow_nan=False,
     )

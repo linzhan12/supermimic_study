@@ -100,6 +100,7 @@ class Config:
   command_cost_weight: float = 0.0
   candidate_entries: int = 1
   start_search_time: float | None = None
+  restart_from_rest: bool = False
   strict_contact: bool = True
 
 
@@ -464,6 +465,7 @@ def evaluate(cfg: Config) -> None:
         "command_cost_weight": cfg.command_cost_weight,
         "candidate_entries": cfg.candidate_entries,
         "start_search_time": cfg.start_search_time,
+        "restart_from_rest": cfg.restart_from_rest,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -526,6 +528,7 @@ def evaluate(cfg: Config) -> None:
             direct_steering_start=cfg.direct_steering_start,
             candidate_entries=cfg.candidate_entries,
             start_search_time=cfg.start_search_time,
+            restart_from_rest=cfg.restart_from_rest,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
@@ -580,7 +583,22 @@ def evaluate(cfg: Config) -> None:
               stop_fallback = partial(
                 stance_bridge, measured, foot_speed, cfg.contact_stop_max_foot_speed
               )
-            planner.update(target, contact[0], score, stop_fallback=stop_fallback)
+            measured_twist = (
+              heading_twist(
+                data.root_link_quat_w,
+                data.root_link_lin_vel_w,
+                data.root_link_ang_vel_w,
+              )[0]
+              if cfg.restart_from_rest
+              else None
+            )
+            planner.update(
+              target,
+              contact[0],
+              score,
+              stop_fallback=stop_fallback,
+              observed_twist=measured_twist,
+            )
             preview = planner.preview()
             goal = preview.actor_goal(torch.zeros_like(env_ids), aux)
           elif route == "motion":

@@ -84,6 +84,7 @@ class ReferenceClip:
   twist: torch.Tensor
   mean_tracking_bias: torch.Tensor
   period_steps: int = 0
+  exit_twist: torch.Tensor | None = None
 
   @classmethod
   def load(
@@ -110,6 +111,11 @@ class ReferenceClip:
       }
       contact = torch.tensor(data["foot_contact"], dtype=torch.bool, device=device)
       period = int(data["period_steps"]) if "period_steps" in data else 0
+      exit_twist = (
+        torch.as_tensor(data["exit_twist"], device=device, dtype=torch.float32)
+        if "exit_twist" in data
+        else None
+      )
     frames = ReferenceWindow(
       arrays["joint_pos"],
       arrays["joint_vel"],
@@ -133,12 +139,18 @@ class ReferenceClip:
       or arrays["mean_tracking_bias"].shape != (3,)
       or not 0 <= period <= count - PREVIEW_STEPS
       or not all(torch.isfinite(a).all() for a in arrays.values())
+      or (
+        exit_twist is not None
+        and (exit_twist.shape != (3,) or not torch.isfinite(exit_twist).all())
+      )
     ):
       raise ValueError(f"{path}: invalid or incomplete motion reference.")
     twist = heading_twist(
       frames.quat, arrays["root_lin_vel_w"], arrays["root_ang_vel_w"]
     )
-    return cls(path.stem, mode, frames, twist, arrays["mean_tracking_bias"], period)
+    return cls(
+      path.stem, mode, frames, twist, arrays["mean_tracking_bias"], period, exit_twist
+    )
 
 
 @dataclass(frozen=True)
@@ -174,6 +186,7 @@ class LocomotionPlanner:
     direct_steering_start: bool = False,
     candidate_entries: int = 1,
     start_search_time: float | None = None,
+    restart_from_rest: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -187,6 +200,7 @@ class LocomotionPlanner:
     self.direct_steering_start = direct_steering_start
     self.candidate_entries = candidate_entries
     self.start_search_time = start_search_time
+    self.restart_from_rest = restart_from_rest
     self.committed_steps = self.blend_steps
     self.clip_direction = (
       {
@@ -211,6 +225,7 @@ class LocomotionPlanner:
     self.filtered_command = initial.p.new_zeros(3)
     self.mode: Mode = "stand"
     self.last_costs: list[dict] = []
+    self.active_direction: tuple[int, int] | None = None
 
   def preview(self) -> ReferenceWindow:
     return self.plan.hold_after(self.offset, PREVIEW_STEPS)
@@ -225,6 +240,7 @@ class LocomotionPlanner:
     score_prediction: Callable[[list[ReferenceWindow]], torch.Tensor] | None = None,
     *,
     stop_fallback: Callable[[], ReferenceWindow | None] | None = None,
+    observed_twist: torch.Tensor | None = None,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -233,6 +249,11 @@ class LocomotionPlanner:
     if self.offset % self.replan_steps:
       return
     moving = bool(command.abs().max() > 0.025)
+    direction = (
+      self._direction(command)
+      if self.directional_selection or self.restart_from_rest
+      else None
+    )
     source_frame = self.frame + self.offset
     active = self.clip
     if active is not None and self.offset < self.committed_steps:
@@ -249,6 +270,7 @@ class LocomotionPlanner:
       active is not None
       and active.mode in ("start", "stop")
       and moving == (active.mode == "start")
+      and (not moving or direction == self.active_direction)
       and source_frame < len(active.frames.q) - 2
     ):
       return
@@ -257,10 +279,17 @@ class LocomotionPlanner:
       self.clip = None
       return
     if moving:
-      mode: Mode = "start" if self.mode == "stand" else "walk"
+      rested = (
+        self.restart_from_rest
+        and self.mode == "stop"
+        and observed_twist is not None
+        and bool(observed_contact.all())
+        and bool(observed_twist[:2].norm() < 0.08)
+        and abs(float(observed_twist[2])) < 0.15
+      )
+      mode: Mode = "start" if self.mode == "stand" or rested else "walk"
     else:
       mode = "stop"
-    direction = self._direction(command) if self.directional_selection else None
     direct_start = (
       self.direct_steering_start
       and self.mode in ("stand", "stop")
@@ -325,6 +354,7 @@ class LocomotionPlanner:
       # same world frame. Restarting the blend would change the phase.
       return
     self.clip = choice.clip
+    self.active_direction = direction
     self.mode = choice.clip.mode
     self.frame = choice.frame
     self.plan = windows[best]
@@ -358,10 +388,17 @@ class LocomotionPlanner:
         continue
       if (
         mode == "walk"
+        and self.directional_selection
         and direction is not None
         and self.clip_direction[clip.name] != direction
       ):
         continue
+      if mode == "start" and self.restart_from_rest and direction is not None:
+        entry_direction = (
+          self._direction(clip.exit_twist) if clip.exit_twist is not None else (0, 0)
+        )
+        if entry_direction != direction:
+          continue
       frames = clip.frames
       last_entry = len(frames.q) - PREVIEW_STEPS
       entries = min(last_entry + 1, clip.period_steps or last_entry + 1)

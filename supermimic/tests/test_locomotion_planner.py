@@ -166,3 +166,23 @@ def test_predicted_twist_uses_command_heading_and_wrapped_yaw():
   current[:, 3:] = torch.nn.functional.normalize(current[:, 3:], dim=-1)
   twist = projected_twist(previous, current, 0.02)
   torch.testing.assert_close(twist, torch.tensor([[0.5, 0.0, 1.0]]), atol=0.001, rtol=0)
+
+
+def test_changed_lateral_command_can_end_compatible_start_after_its_seam():
+  initial = window(1)
+  frames = window(90)
+  left = torch.tensor([0.25, 0.2, 0.0])
+  right = torch.tensor([0.25, -0.2, 0.0])
+  bias = torch.zeros(3)
+  launch = ReferenceClip(
+    "launch", "start", frames, left.expand(90, -1), bias, exit_twist=left
+  )
+  walk = ReferenceClip("right", "walk", frames, right.expand(90, -1), bias)
+  planner = LocomotionPlanner([launch, walk], initial, 0.02, restart_from_rest=True)
+  support = torch.tensor([True, True])
+  planner.update(left, support)
+  assert planner.clip is launch
+  for _ in range(10):
+    planner.advance()
+  planner.update(right, support)
+  assert planner.clip is walk
