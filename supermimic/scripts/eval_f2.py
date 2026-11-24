@@ -94,6 +94,7 @@ class Config:
   stop_double_support_pose: float | None = None
   contact_stop_duration: float | None = None
   contact_stop_max_foot_speed: float | None = None
+  refresh_contact_stand: bool = False
   start_upper_blend: float | None = None
   directional_selection: bool = False
   direct_steering_start: bool = False
@@ -286,6 +287,10 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Axial cycle ranking needs direction-specific candidates.")
   if cfg.steering_measured_seam and not cfg.directional_selection:
     raise ValueError("Steering seams need direction-specific candidates.")
+  if cfg.refresh_contact_stand and (
+    cfg.contact_stop_duration is None or not cfg.restart_from_rest
+  ):
+    raise ValueError("Contact stand refresh requires measured stop and restart.")
   if cfg.start_search_time is not None and not 0.0 < cfg.start_search_time <= 1.0:
     raise ValueError("The start search window must be between zero and one second.")
   if not 1 <= cfg.prediction_steps <= 30:
@@ -498,6 +503,7 @@ def evaluate(cfg: Config) -> None:
         "stop_double_support_pose": cfg.stop_double_support_pose,
         "contact_stop_duration": cfg.contact_stop_duration,
         "contact_stop_max_foot_speed": cfg.contact_stop_max_foot_speed,
+        "refresh_contact_stand": cfg.refresh_contact_stand,
         "start_upper_blend": cfg.start_upper_blend,
         "directional_selection": cfg.directional_selection,
         "direct_steering_start": cfg.direct_steering_start,
@@ -576,6 +582,7 @@ def evaluate(cfg: Config) -> None:
             start_search_time=cfg.start_search_time,
             restart_from_rest=cfg.restart_from_rest,
             axial_cycle_ranking=cfg.axial_cycle_ranking,
+            refresh_contact_stand=cfg.refresh_contact_stand,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"

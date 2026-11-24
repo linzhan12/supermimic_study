@@ -212,6 +212,7 @@ class LocomotionPlanner:
     start_search_time: float | None = None,
     restart_from_rest: bool = False,
     axial_cycle_ranking: bool = False,
+    refresh_contact_stand: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -227,6 +228,9 @@ class LocomotionPlanner:
     self.start_search_time = start_search_time
     self.restart_from_rest = restart_from_rest
     self.axial_cycle_ranking = axial_cycle_ranking
+    self.refresh_contact_stand = refresh_contact_stand
+    self.generated_stop = False
+    self.settled_contact_stand = False
     self.committed_steps = self.blend_steps
     self.clip_direction = (
       {
@@ -307,6 +311,19 @@ class LocomotionPlanner:
     if active is None and self.mode == "start" and self.offset >= len(self.plan.q) - 1:
       self.mode = "stand" if measured_rest else "walk"
     if not moving and self.mode == "stand":
+      if (
+        self.refresh_contact_stand
+        and self.generated_stop
+        and stop_fallback is not None
+        and observed_twist is not None
+        and bool(observed_contact.all())
+      ):
+        speed = float(observed_twist[:2].norm())
+        self.settled_contact_stand |= speed < 0.03
+        if self.settled_contact_stand and speed > 0.055:
+          recovery = stop_fallback()
+          if recovery is not None:
+            self._commit_generated(recovery, "stop", direction)
       return
     # A start or stop has a task-relevant contact sequence. Finish it unless
     # the operator changes between moving and stopping, then replan immediately.
@@ -421,6 +438,7 @@ class LocomotionPlanner:
       # same world frame. Restarting the blend would change the phase.
       return
     self.clip = choice.clip
+    self.generated_stop = False
     self.active_direction = direction
     self.mode = choice.clip.mode
     self.frame = choice.frame
@@ -436,6 +454,8 @@ class LocomotionPlanner:
     self.plan = plan
     self.mode = mode
     self.clip = None
+    self.generated_stop = mode == "stop"
+    self.settled_contact_stand = False
     self.active_direction = direction
     self.last_costs = []
     self.frame = self.offset = 0

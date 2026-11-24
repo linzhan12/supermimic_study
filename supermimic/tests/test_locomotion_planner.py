@@ -129,6 +129,34 @@ def test_recovery_waits_for_two_measured_support_feet_and_finishes_its_plan():
   assert not planner.preview().qd.any()
 
 
+def test_contact_stand_refreshes_only_on_measured_drift_after_generated_stop():
+  initial = window(1)
+  frames = window(90)
+  twist = frames.q.new_zeros((90, 3))
+  walk = ReferenceClip("walk", "walk", frames, twist, torch.zeros(3))
+  planner = LocomotionPlanner([walk], initial, 0.02, refresh_contact_stand=True)
+  first, refresh = window(11, 0.1), window(11, 0.2)
+  command = torch.zeros(3)
+  support = torch.tensor([True, True])
+  drifting = torch.tensor([0.06, 0.0, 0.0])
+  planner.update(command, support, observed_twist=drifting, stop_fallback=lambda: first)
+  assert planner.mode == "stand"
+  planner.mode = "walk"
+  planner.update(command, support, stop_fallback=lambda: first)
+  for _ in first.q[1:]:
+    planner.advance()
+    planner.update(
+      command, support, observed_twist=command, stop_fallback=lambda: refresh
+    )
+  assert planner.mode == "stand"
+  assert planner.plan is first
+  planner.update(
+    command, support, observed_twist=drifting, stop_fallback=lambda: refresh
+  )
+  assert planner.mode == "stop"
+  assert planner.plan is refresh
+
+
 def test_start_can_blend_arms_slower_when_measured_leg_support_matches():
   old = window(1)
   walk_frames = window(90)
