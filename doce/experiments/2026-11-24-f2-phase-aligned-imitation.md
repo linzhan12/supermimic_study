@@ -50,3 +50,38 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=offline .venv/bin/python -u src/supermimic/scr
 ```
 
 四环境物理及想象奖励最大绝对差 `1.86×10⁻⁹`。233 个仓库测试通过。完整结果以 50 Hz MuJoCo 闭环回放为准。
+
+### 闭环结果与保存点选择
+
+中间第 2,000 次权重的三档实测平均前向为 `0.248 / 0.368 / 0.519 m/s`，肩摆分别为 `12.2° / 10.0°`、`12.8° / 13.1°`、`14.5° / 15.5°`。保留中速重心转移 `8.3 cm`、躯干倾斜 `6.5°`、支撑脚尖 `+9.2° / −9.7°`。最终第 3,800 次权重的肩摆仍在该范围附近，主场景慢速右脚却连续多次重新落地，严格完整摆动计数为 `2 / 6`，右脚落脚前后间距中位数 `3.7 cm`、中位离地 `5 mm`。因此继续保留较早保存点作为复查起点。本机为 `outputs/f2-full-body-arm-teacher-i2000/`，actor SHA-256 `e81a6f2a3937eb9868acb44dece17b83f44b0dce46210485f13da0e364f6c135`。
+
+将同一早期权重在三条额外留出动作上复验，共四组、四十条闭环路线完成。八条完整参考路线逐字节等同各自的 F1。所有组的直走逐帧侧向误差和慢速、中速换速末半秒仍超限。`walk4_subject1` 和 `walk3_subject4` 的快走完整摆动计数为 `4 / 2`，快走在不同初态下的支撑切换仍不稳定。主场景走后松杆末半秒关节 RMS 从 F1 的 `0.359` 降至 `0.194 rad`，平均躯干倾斜由 `13.65°` 降至 `4.38°`。
+
+主场景慢速与中速换速最后半秒平均侧向 `−0.128 / −0.158 m/s`，按一个完整指令相位周期（74 步及 64 步）取平均为 `+0.008 / +0.002 m/s`。周期平均抵消了部分步态侧向变化，历史筛查结果原样保留。**四组 F2 仍未通过。** 快走支撑脚尖约 `+16° / −17°`，相近速度的完整参考约 `+4° / 0°`。下一组先检查真实快走的支撑与落脚时刻是否能用完整周期稳定监督。
+
+### 同一实测速度视频对照
+
+另用 `0.332 m/s` 指令生成中间权重的对照轨迹。选择各段平均实际前向均为 `0.350 m/s` 的 85 帧，旧 F2 和本轮权重各取稳态，完整参考取留出 `walk2_subject4`。正面和侧面同步显示，速度标签为该画面的瞬时值。文件在 `supermimic/outputs/f2-full-body-audit/f2-matched-full-body-035.gif`，同名 PNG 是一帧预览。
+
+| 轨迹 | 支撑脚尖 左 / 右（°） | 支撑膝 左 / 右（°） | 骨盆侧摆（cm） | 肩摆 左 / 右（°） |
+| --- | ---: | ---: | ---: | ---: |
+| 完整参考 | +2.5 / −6.3 | 19.7 / 28.9 | 8.5 | 12.4 / 6.7 |
+| 旧 F2 | +38.0 / −36.1 | 18.1 / 15.6 | 1.0 | 27.1 / 27.2 |
+| 本轮中间保存点 | +8.0 / −8.6 | 27.7 / 26.6 | 8.7 | 12.2 / 12.3 |
+
+相近速度下新权重的脚尖、骨盆转移和左右肩摆的量级更接近完整参考。正面和侧面仍能看到新权重左支撑膝偏屈、对照右臂摆幅偏大的差异，快走的落脚失衡也未解决。回放无需 W&B。
+
+```bash
+cd /home/hi/SuperMimic-Official/supermimic
+OMP_NUM_THREADS=2 .venv/bin/python -u scripts/eval_p0.py \
+  --checkpoint-dir outputs/f2-full-body-arm-teacher-i2000 \
+  --motion-file ../data/lafan1_official/walk1_subject1.npz --record-posture True \
+  --extra-forward-speeds '(0.332,)' --output-dir outputs/f2-full-body-arm-teacher-035-repro
+MUJOCO_GL=egl EGL_PLATFORM=surfaceless .venv/bin/python scripts/audit_forward_gait.py \
+  --trace 'Complete reference' outputs/f2-holdout-subject4-f1/stand_start_motion.jsonl 355 440 \
+  --trace 'Previous F2' outputs/f2-steering-i1600-s0/steady_forward_scripted_velocity.jsonl 180 265 \
+  --trace 'Latest F2 probe' outputs/f2-full-body-arm-teacher-035-repro/steady_forward_0p332_scripted_velocity.jsonl 176 261 \
+  --replay-gif outputs/f2-full-body-audit/f2-matched-full-body-035.gif
+```
+
+快走的下一轮物理教师筛选和训练记录见[快走参考校准](2026-11-24-f2-fast-reference-calibration.md)。
