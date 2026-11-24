@@ -211,6 +211,7 @@ class LocomotionPlanner:
     candidate_entries: int = 1,
     start_search_time: float | None = None,
     restart_from_rest: bool = False,
+    axial_cycle_ranking: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -225,6 +226,7 @@ class LocomotionPlanner:
     self.candidate_entries = candidate_entries
     self.start_search_time = start_search_time
     self.restart_from_rest = restart_from_rest
+    self.axial_cycle_ranking = axial_cycle_ranking
     self.committed_steps = self.blend_steps
     self.clip_direction = (
       {
@@ -266,6 +268,7 @@ class LocomotionPlanner:
     stop_fallback: Callable[[], ReferenceWindow | None] | None = None,
     observed_twist: torch.Tensor | None = None,
     contact_launch: Callable[[], list[tuple[str, ReferenceWindow]]] | None = None,
+    measured_steering_anchor: ReferenceWindow | None = None,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -362,12 +365,17 @@ class LocomotionPlanner:
     start_goal = (
       command if mode == "start" and self.start_search_time is not None else None
     )
+    seam = (
+      measured_steering_anchor
+      if moving and direction not in (None, (0, 0), self.active_direction)
+      else None
+    )
     candidates = self._candidates(
-      mode, observed_contact, direction, direct_start, start_goal
+      mode, observed_contact, direction, direct_start, start_goal, seam=seam
     )
     if not candidates and mode == "start":
       mode = "walk"
-      candidates = self._candidates(mode, observed_contact, direction)
+      candidates = self._candidates(mode, observed_contact, direction, seam=seam)
     if not candidates:
       self.last_costs = []
       if mode == "stop" and stop_fallback is not None and bool(observed_contact.all()):
@@ -382,9 +390,10 @@ class LocomotionPlanner:
         for candidate in candidates
         if candidate.pace_error <= smallest + self.pace_margin
       ]
-    shortlist = max(4, 2 * self.candidate_entries + 2)
+    entry_count = self._entry_count(mode, direction)
+    shortlist = max(4, 2 * entry_count + 2)
     candidates = sorted(candidates, key=lambda candidate: candidate.cost)[:shortlist]
-    windows = [self._join(candidate) for candidate in candidates]
+    windows = [self._join(candidate, seam=seam) for candidate in candidates]
     prediction = (
       score_prediction(windows).tolist()
       if score_prediction is not None and self.weight > 0
@@ -407,7 +416,7 @@ class LocomotionPlanner:
       for i, (candidate, extra) in enumerate(zip(candidates, prediction, strict=True))
     ]
     choice = candidates[best]
-    if self._continues(choice):
+    if seam is None and self._continues(choice):
       # This trajectory already contains the next source samples in the
       # same world frame. Restarting the blend would change the phase.
       return
@@ -439,6 +448,13 @@ class LocomotionPlanner:
       1 if turn > 0.16 else -1 if turn < -0.16 else 0,
     )
 
+  def _entry_count(self, mode: Mode, direction: tuple[int, int] | None) -> int:
+    return (
+      1
+      if self.axial_cycle_ranking and mode == "walk" and direction == (0, 0)
+      else self.candidate_entries
+    )
+
   def _candidates(
     self,
     mode: Mode,
@@ -446,8 +462,10 @@ class LocomotionPlanner:
     direction: tuple[int, int] | None = None,
     direct_start: bool = False,
     start_goal: torch.Tensor | None = None,
+    *,
+    seam: ReferenceWindow | None = None,
   ) -> list[_Candidate]:
-    old = self.plan.hold_after(self.offset, self.blend_steps + 1)
+    old = self.plan.hold_after(self.offset, 1) if seam is None else seam
     old_support = old.contact[0] if old.contact[0].any() else observed_contact
     continued = self.frame + self.offset
     choices = []
@@ -530,7 +548,7 @@ class LocomotionPlanner:
         score = score.masked_fill(~compatible, torch.inf)
       if clip is self.clip:
         score = score - 0.20 * (indices == continued)
-      for _ in range(self.candidate_entries):
+      for _ in range(self._entry_count(mode, direction)):
         index = int(score.argmin())
         if not torch.isfinite(score[index]):
           break
@@ -565,13 +583,19 @@ class LocomotionPlanner:
     rate = 30 * u.square() * (1 - u).square() / (steps * self.dt)
     return amount, rate
 
-  def _join(self, candidate: _Candidate) -> ReferenceWindow:
-    if self._continues(candidate):
+  def _join(
+    self, candidate: _Candidate, *, seam: ReferenceWindow | None = None
+  ) -> ReferenceWindow:
+    if seam is None and self._continues(candidate):
       return self.plan.hold_after(self.offset, self.preview_length)
 
     split_start = candidate.split_start
     count = (self.start_blend_steps if split_start else self.blend_steps) + 1
-    old = self.plan.hold_after(self.offset, count)
+    old = (
+      self.plan.hold_after(self.offset, count)
+      if seam is None
+      else seam.hold_after(0, count)
+    )
     remaining = len(candidate.clip.frames.q) - candidate.frame
     new = candidate.clip.frames.hold_after(
       candidate.frame, max(remaining, self.preview_length)

@@ -160,6 +160,42 @@ def test_direction_filter_uses_signed_requested_turn():
   assert [candidate["clip"] for candidate in planner.last_costs] == ["left"]
 
 
+def test_axial_cycle_ranking_retains_multiple_steering_entries():
+  old = window(1)
+  frames = window(90)
+  axial = torch.tensor([0.35, 0.0, 0.0])
+  turn = torch.tensor([0.35, 0.0, 0.4])
+  bias = torch.zeros(3)
+  walk = ReferenceClip("straight", "walk", frames, axial.expand(90, -1), bias)
+  left = ReferenceClip("left", "walk", frames, turn.expand(90, -1), bias)
+  support = torch.tensor([True, True])
+  for target, expected in ((axial, 1), (turn, 3)):
+    planner = LocomotionPlanner(
+      [walk, left],
+      old,
+      0.02,
+      directional_selection=True,
+      candidate_entries=3,
+      axial_cycle_ranking=True,
+    )
+    planner.update(target, support)
+    assert len(planner.last_costs) == expected
+
+
+def test_changed_steering_direction_joins_at_measured_support_state():
+  old = window(1)
+  old.q.fill_(0.8)
+  measured = window(1, 0.1)
+  frames = window(90, 0.1)
+  turn = torch.tensor([0.35, 0.0, 0.4])
+  left = ReferenceClip("left", "walk", frames, turn.expand(90, -1), torch.zeros(3))
+  planner = LocomotionPlanner([left], old, 0.02, directional_selection=True)
+  support = torch.tensor([True, True])
+  planner.update(turn, support, measured_steering_anchor=measured)
+  assert planner.clip is left
+  torch.testing.assert_close(planner.preview().q[0], measured.q[0])
+
+
 def test_predicted_twist_uses_command_heading_and_wrapped_yaw():
   previous = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
   current = torch.tensor([[-0.01, 0.0, 0.0, 0.01, 0.0, 0.0, -1.0]])

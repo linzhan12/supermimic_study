@@ -99,6 +99,8 @@ class Config:
   direct_steering_start: bool = False
   command_cost_weight: float = 0.0
   candidate_entries: int = 1
+  axial_cycle_ranking: bool = False
+  steering_measured_seam: bool = False
   start_search_time: float | None = None
   restart_from_rest: bool = False
   heading_strength: float = 0.0
@@ -280,6 +282,10 @@ def evaluate(cfg: Config) -> None:
     )
   if not 1 <= cfg.candidate_entries <= 4:
     raise ValueError("Choose one to four entry phases per reference.")
+  if cfg.axial_cycle_ranking and not cfg.directional_selection:
+    raise ValueError("Axial cycle ranking needs direction-specific candidates.")
+  if cfg.steering_measured_seam and not cfg.directional_selection:
+    raise ValueError("Steering seams need direction-specific candidates.")
   if cfg.start_search_time is not None and not 0.0 < cfg.start_search_time <= 1.0:
     raise ValueError("The start search window must be between zero and one second.")
   if not 1 <= cfg.prediction_steps <= 30:
@@ -497,6 +503,8 @@ def evaluate(cfg: Config) -> None:
         "direct_steering_start": cfg.direct_steering_start,
         "command_cost_weight": cfg.command_cost_weight,
         "candidate_entries": cfg.candidate_entries,
+        "axial_cycle_ranking": cfg.axial_cycle_ranking,
+        "steering_measured_seam": cfg.steering_measured_seam,
         "start_search_time": cfg.start_search_time,
         "restart_from_rest": cfg.restart_from_rest,
         "heading_strength": cfg.heading_strength,
@@ -567,6 +575,7 @@ def evaluate(cfg: Config) -> None:
             candidate_entries=cfg.candidate_entries,
             start_search_time=cfg.start_search_time,
             restart_from_rest=cfg.restart_from_rest,
+            axial_cycle_ranking=cfg.axial_cycle_ranking,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
@@ -591,6 +600,9 @@ def evaluate(cfg: Config) -> None:
           if planner is not None:
             assert feet.data.found is not None
             aux = wm.representation.extract_aux_state(obs["full_state"])
+            pure_forward = cfg.axial_cycle_ranking and bool(
+              (target[0] > 0.025) & (target[1:].abs().max() < 0.025)
+            )
 
             score = partial(
               predict_tracking_cost,
@@ -603,14 +615,17 @@ def evaluate(cfg: Config) -> None:
               context=sim_ctx,
               steps=cfg.prediction_steps,
               command=target,
-              command_weight=cfg.command_cost_weight,
+              command_weight=0.0
+              if pure_forward and planner.mode == "walk"
+              else cfg.command_cost_weight,
               dt=dt,
               heading_strength=cfg.heading_strength,
             )
             contact = feet.data.found > 0
             stop_fallback = None
             contact_launch = None
-            if stance_bridge is not None:
+            measured = None
+            if stance_bridge is not None or cfg.steering_measured_seam:
               measured = ReferenceWindow(
                 data.joint_pos,
                 data.joint_vel,
@@ -619,6 +634,8 @@ def evaluate(cfg: Config) -> None:
                 data.site_pos_w[:, foot_sites],
                 contact,
               )
+            if stance_bridge is not None:
+              assert measured is not None
               foot_speed = data.site_lin_vel_w[0, foot_sites, :2].norm(dim=-1)
               if cfg.contact_stop_duration is not None:
                 stop_fallback = partial(
@@ -651,6 +668,7 @@ def evaluate(cfg: Config) -> None:
               stop_fallback=stop_fallback,
               observed_twist=measured_twist,
               contact_launch=contact_launch,
+              measured_steering_anchor=measured if cfg.steering_measured_seam else None,
             )
             preview = planner.preview()
             goal = preview.actor_goal(
