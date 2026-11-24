@@ -117,6 +117,7 @@ class Config:
   preserve_axial_phase: bool = False
   steering_measured_seam: bool = False
   steering_split_seam: bool = False
+  early_steering_handoff: bool = False
   project_contact_seam: bool = False
   rank_contact_seam: bool = False
   start_search_time: float | None = None
@@ -394,6 +395,10 @@ def evaluate(cfg: Config) -> None:
     raise ValueError(
       "Split steering seams need the measured seam and an upper-body blend."
     )
+  if cfg.early_steering_handoff and not (
+    cfg.steering_measured_seam and cfg.restart_from_rest
+  ):
+    raise ValueError("Early steering handoff needs measured geometry and velocity.")
   if cfg.project_contact_seam and not (
     cfg.steering_measured_seam or cfg.start_measured_handoff
   ):
@@ -677,6 +682,8 @@ def evaluate(cfg: Config) -> None:
         summary["planning"]["axial_heading_on_change"] = cfg.axial_heading_on_change
       if cfg.steering_split_seam:
         summary["planning"]["steering_split_seam"] = True
+      if cfg.early_steering_handoff:
+        summary["planning"]["early_steering_handoff"] = True
       if cfg.project_contact_seam:
         summary["planning"]["project_contact_seam"] = True
       if cfg.rank_contact_seam:
@@ -769,6 +776,7 @@ def evaluate(cfg: Config) -> None:
             preserve_axial_phase=cfg.preserve_axial_phase,
             rank_contact_seam=cfg.rank_contact_seam,
             contact_launch_axial=cfg.contact_launch_axial,
+            early_steering_handoff=cfg.early_steering_handoff,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"

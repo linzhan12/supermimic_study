@@ -259,6 +259,7 @@ class LocomotionPlanner:
     preserve_axial_phase: bool = False,
     rank_contact_seam: bool = False,
     contact_launch_axial: bool = False,
+    early_steering_handoff: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -279,6 +280,7 @@ class LocomotionPlanner:
     self.preserve_axial_phase = preserve_axial_phase
     self.rank_contact_seam = rank_contact_seam
     self.contact_launch_axial = contact_launch_axial
+    self.early_steering_handoff = early_steering_handoff
     self.generated_stop = False
     self.settled_contact_stand = False
     self.committed_steps = self.blend_steps
@@ -379,11 +381,26 @@ class LocomotionPlanner:
           if recovery is not None:
             self._commit_generated(recovery, "stop", direction)
       return
+    steering_ready = False
+    if (
+      self.early_steering_handoff
+      and moving
+      and active is not None
+      and active.mode == "start"
+      and direction not in (None, (0, 0))
+      and direction == self.active_direction
+      and observed_twist is not None
+      and bool(observed_contact.any())
+      and self.offset * self.dt >= 0.28
+    ):
+      axis, minimum = (1, 0.04) if direction[0] else (2, 0.10)
+      steering_ready = bool(observed_twist[axis] * command[axis].sign() >= minimum)
     # A start or stop has a task-relevant contact sequence. Finish it unless
     # the operator changes between moving and stopping, then replan immediately.
     if (
       active is not None
       and active.mode in ("start", "stop")
+      and not steering_ready
       and moving == (active.mode == "start")
       and (not moving or direction == self.active_direction)
       and source_frame < len(active.frames.q) - 2
@@ -446,7 +463,8 @@ class LocomotionPlanner:
     )
     seam = (
       measured_steering_anchor
-      if moving and direction not in (None, (0, 0), self.active_direction)
+      if moving
+      and (steering_ready or direction not in (None, (0, 0), self.active_direction))
       else None
     )
     if (
