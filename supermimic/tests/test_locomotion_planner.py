@@ -110,6 +110,24 @@ def test_trackability_ranking_does_not_select_an_incompatible_pace():
   assert [candidate["clip"] for candidate in planner.last_costs] == ["medium"]
 
 
+def test_axial_continuation_is_eligible_during_a_reference_contact_gap():
+  old = window(1)
+  frames = window(120)
+  pace = torch.tensor([0.35, 0.0, 0.0])
+  clip = ReferenceClip("period", "walk", frames, pace.expand(120, -1), torch.zeros(3))
+  planner = LocomotionPlanner([clip], old, 0.02, preserve_axial_phase=True)
+  support = torch.tensor([True, True])
+  planner.update(pace, support)
+  assert planner.clip is clip
+  plan = planner.plan
+  frames.contact[10] = False
+  for _ in range(10):
+    planner.advance()
+  planner.update(pace, support)
+  assert [choice["frame"] for choice in planner.last_costs] == [10]
+  assert planner.plan is plan
+
+
 def test_recovery_waits_for_two_measured_support_feet_and_finishes_its_plan():
   initial = window(1)
   moving = window(120)
@@ -270,6 +288,35 @@ def test_changed_steering_direction_joins_at_measured_support_state():
   planner.update(turn, support, measured_steering_anchor=measured)
   assert planner.clip is left
   torch.testing.assert_close(planner.preview().q[0], measured.q[0])
+
+
+def test_split_steering_requires_matching_measured_support_for_a_large_arm_gap():
+  measured = window(1)
+  frames = window(90, 0.5)
+  frames.q[:, :12] = 0.08
+  turn = torch.tensor([0.25, -0.2, 0.0])
+  swing = torch.tensor([True, False])
+  frames.contact[:] = swing
+  measured.contact[:] = swing
+  clip = ReferenceClip("right", "walk", frames, turn.expand(90, -1), torch.zeros(3))
+  planner = LocomotionPlanner(
+    [clip],
+    measured,
+    0.02,
+    start_legs=tuple(range(12)),
+    start_upper_blend=0.48,
+    directional_selection=True,
+    steering_split_seam=True,
+  )
+  planner.mode = "walk"
+  planner.update(turn, torch.tensor([True, True]), measured_steering_anchor=measured)
+  assert planner.clip is None
+  planner.update(turn, swing, measured_steering_anchor=measured)
+  assert planner.clip is clip
+  assert planner.committed_steps == planner.blend_steps
+  preview = planner.preview()
+  torch.testing.assert_close(preview.q[8, :12], frames.q[0, :12])
+  assert bool((preview.q[8, 12:] < frames.q[0, 12:]).all())
 
 
 def test_predicted_twist_uses_command_heading_and_wrapped_yaw():

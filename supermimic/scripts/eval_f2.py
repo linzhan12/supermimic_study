@@ -113,11 +113,15 @@ class Config:
   command_cost_weight: float = 0.0
   candidate_entries: int = 1
   axial_cycle_ranking: bool = False
+  preserve_axial_phase: bool = False
   steering_measured_seam: bool = False
+  steering_split_seam: bool = False
   start_search_time: float | None = None
   restart_from_rest: bool = False
   heading_strength: float = 0.0
   diagonal_heading_lock: bool = False
+  axial_heading_lock: bool = False
+  axial_heading_on_change: bool = False
   contact_launch_duration: float | None = None
   contact_launch_lean: float = 0.0
   contact_launch_forward_lead: float = 0.0
@@ -329,12 +333,14 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Command cost requires world-model ranking.")
   if not 0.0 <= cfg.heading_strength <= 1.0:
     raise ValueError("Heading guidance strength must be in [0, 1].")
-  if cfg.diagonal_heading_lock and (
+  if (cfg.diagonal_heading_lock or cfg.axial_heading_lock) and (
     not cfg.heading_strength or cfg.reference_bank is None
   ):
     raise ValueError(
-      "Diagonal heading lock needs bounded heading guidance and a reference bank."
+      "Heading lock needs bounded heading guidance and a reference bank."
     )
+  if cfg.axial_heading_on_change and not cfg.axial_heading_lock:
+    raise ValueError("Speed-change heading lock needs axial heading guidance.")
   if cfg.contact_launch_duration is not None and (
     cfg.reference_bank is None
     or not cfg.restart_from_rest
@@ -365,8 +371,16 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Choose one to four entry phases per reference.")
   if cfg.axial_cycle_ranking and not cfg.directional_selection:
     raise ValueError("Axial cycle ranking needs direction-specific candidates.")
+  if cfg.preserve_axial_phase and cfg.reference_bank is None:
+    raise ValueError("Axial phase preservation needs a reference bank.")
   if cfg.steering_measured_seam and not cfg.directional_selection:
     raise ValueError("Steering seams need direction-specific candidates.")
+  if cfg.steering_split_seam and (
+    not cfg.steering_measured_seam or cfg.start_upper_blend is None
+  ):
+    raise ValueError(
+      "Split steering seams need the measured seam and an upper-body blend."
+    )
   if cfg.refresh_contact_stand and (
     cfg.contact_stop_duration is None or not cfg.restart_from_rest
   ):
@@ -629,6 +643,13 @@ def evaluate(cfg: Config) -> None:
         summary["planning"]["contact_stop_capture"] = True
       if cfg.diagonal_heading_lock:
         summary["planning"]["diagonal_heading_lock"] = True
+      if cfg.axial_heading_lock:
+        summary["planning"]["axial_heading_lock"] = True
+        summary["planning"]["axial_heading_on_change"] = cfg.axial_heading_on_change
+      if cfg.steering_split_seam:
+        summary["planning"]["steering_split_seam"] = True
+      if cfg.preserve_axial_phase:
+        summary["planning"]["preserve_axial_phase"] = True
       if cfg.contact_adapter is not None:
         summary["planning"].update(
           contact_adapter_sha256=sha256(cfg.contact_adapter),
@@ -674,7 +695,9 @@ def evaluate(cfg: Config) -> None:
         tape = None
         moved = False
         last_command_steered = False
-        diagonal_heading = None
+        locked_heading = None
+        last_axial_target = None
+        axial_speed_changed = False
         if route == "planned":
           assert feet.data.found is not None
           initial_window = ReferenceWindow(
@@ -703,6 +726,8 @@ def evaluate(cfg: Config) -> None:
             restart_from_rest=cfg.restart_from_rest,
             axial_cycle_ranking=cfg.axial_cycle_ranking,
             refresh_contact_stand=cfg.refresh_contact_stand,
+            steering_split_seam=cfg.steering_split_seam,
+            preserve_axial_phase=cfg.preserve_axial_phase,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"
@@ -768,15 +793,35 @@ def evaluate(cfg: Config) -> None:
             assert feet.data.found is not None
             aux = wm.representation.extract_aux_state(obs["full_state"])
             contact = feet.data.found > 0
-            if (
-              cfg.diagonal_heading_lock
-              and abs(float(target[1])) > 0.10
-              and abs(float(target[2])) <= 0.16
-            ):
-              if diagonal_heading is None:
-                diagonal_heading = yaw_quat(aux[:, 3:])
+            if cfg.diagonal_heading_lock or cfg.axial_heading_lock:
+              sideways = abs(float(target[1])) > 0.10
+              no_turn = abs(float(target[2])) <= 0.16
+              forward = float(target[0])
+              moving_axial = not sideways and forward > 0.025 and no_turn
+              if moving_axial and cfg.axial_heading_on_change:
+                if last_axial_target is None:
+                  last_axial_target = forward
+                elif abs(forward - last_axial_target) >= 0.07:
+                  axial_speed_changed = True
+                  last_axial_target = forward
+              elif not moving_axial:
+                last_axial_target = None
+                axial_speed_changed = False
+              hold_axial = (
+                cfg.axial_heading_lock
+                and moving_axial
+                and (not cfg.axial_heading_on_change or axial_speed_changed)
+              )
+              use_heading_lock = no_turn and (
+                (cfg.diagonal_heading_lock and sideways) or hold_axial
+              )
+              if use_heading_lock:
+                if locked_heading is None:
+                  locked_heading = yaw_quat(aux[:, 3:])
+              else:
+                locked_heading = None
             else:
-              diagonal_heading = None
+              locked_heading = None
             if adapter is not None:
               if bool(target.abs().max() > 0.025):
                 moved = True
@@ -808,7 +853,7 @@ def evaluate(cfg: Config) -> None:
               else cfg.command_cost_weight,
               dt=dt,
               heading_strength=cfg.heading_strength,
-              heading_anchor=diagonal_heading,
+              heading_anchor=locked_heading,
               adapter=adapter if adapt_here and cfg.adapt_ranking else None,
               measured_contact=contact,
               adapter_gain=cfg.adapter_gain,
@@ -886,7 +931,7 @@ def evaluate(cfg: Config) -> None:
               yaw_rate=float(target[2]) if cfg.heading_strength else 0.0,
               heading_strength=cfg.heading_strength,
               dt=dt,
-              heading_anchor=diagonal_heading,
+              heading_anchor=locked_heading,
             )
           elif route == "motion":
             goal = extract_actor_goal(obs["goal"])
@@ -928,7 +973,7 @@ def evaluate(cfg: Config) -> None:
               wm.representation.extract_aux_state(obs["full_state"]),
               feet.data.found > 0,
               adapt_here,
-              diagonal_heading,
+              locked_heading,
             )
           actual = heading_twist(
             data.root_link_quat_w, data.root_link_lin_vel_w, data.root_link_ang_vel_w

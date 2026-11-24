@@ -255,6 +255,8 @@ class LocomotionPlanner:
     restart_from_rest: bool = False,
     axial_cycle_ranking: bool = False,
     refresh_contact_stand: bool = False,
+    steering_split_seam: bool = False,
+    preserve_axial_phase: bool = False,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -271,6 +273,8 @@ class LocomotionPlanner:
     self.restart_from_rest = restart_from_rest
     self.axial_cycle_ranking = axial_cycle_ranking
     self.refresh_contact_stand = refresh_contact_stand
+    self.steering_split_seam = steering_split_seam
+    self.preserve_axial_phase = preserve_axial_phase
     self.generated_stop = False
     self.settled_contact_stand = False
     self.committed_steps = self.blend_steps
@@ -490,7 +494,9 @@ class LocomotionPlanner:
     self.plan = windows[best]
     self.offset = 0
     self.committed_steps = (
-      self.start_blend_steps if choice.split_start else self.blend_steps
+      self.start_blend_steps
+      if choice.split_start and (seam is None or mode == "start" or direct_start)
+      else self.blend_steps
     )
 
   def _commit_generated(
@@ -533,6 +539,12 @@ class LocomotionPlanner:
     old = self.plan.hold_after(self.offset, 1) if seam is None else seam
     old_support = old.contact[0] if old.contact[0].any() else observed_contact
     continued = self.frame + self.offset
+    starting = mode == "start" or direct_start
+    split_steering = self.steering_split_seam and seam is not None and mode == "walk"
+    split = bool(self.start_legs) and (starting or split_steering)
+    keep_phase = self.preserve_axial_phase and (
+      direction if direction is not None else self._direction(self.filtered_command)
+    ) == (0, 0)
     choices = []
     for clip in self.clips:
       if clip.mode != mode:
@@ -559,7 +571,8 @@ class LocomotionPlanner:
         indices = indices[: max(1, round(horizon / self.dt))]
       if mode == "stop":
         indices = indices[: max(1, round(0.80 / self.dt))]
-      if clip is self.clip and continued <= last_entry and mode == "walk":
+      advancing = clip is self.clip and continued <= last_entry and mode == "walk"
+      if advancing:
         indices = torch.tensor([continued], device=frames.q.device)
       # Match ordered support and compare stance feet relative to the pelvis.
       new_contact = frames.contact[indices]
@@ -594,11 +607,14 @@ class LocomotionPlanner:
       if self.strict_contact:
         # A standing pose can differ in arm posture from the recorded start.
         # Permit that difference when both feet remain in support at the join.
-        starting = mode == "start" or direct_start
         double_support_start = starting & common.all(-1)
         pose_limit = torch.where(double_support_start, 0.32, 0.26)
-        if starting and self.start_legs:
-          supported = double_support_start & observed_contact.all()
+        if split:
+          supported = (
+            common.any(-1) & (new_contact == observed_contact).all(-1)
+            if split_steering
+            else double_support_start & observed_contact.all()
+          )
           leg_gap = frames.q[indices][:, self.start_legs] - old.q[0, self.start_legs]
           admissible = supported & (leg_gap.square().mean(-1).sqrt() < 0.18)
           pose_limit = torch.where(admissible, 0.55, pose_limit)
@@ -610,6 +626,10 @@ class LocomotionPlanner:
         compatible = (
           common.any(-1) & (pose_cost.sqrt() < pose_limit) & (foot_cost < 0.04)
         )
+        if keep_phase and advancing and seam is None:
+          # The existing plan does not form a seam. A missing kinematic
+          # support label cannot invalidate its next chronological frame.
+          compatible |= indices == continued
         score = score.masked_fill(~compatible, torch.inf)
       if clip is self.clip:
         score = score - 0.20 * (indices == continued)
@@ -624,7 +644,7 @@ class LocomotionPlanner:
             int(indices[index]),
             float(score[index]),
             error,
-            bool(self.start_legs) and (mode == "start" or direct_start),
+            split,
           )
         )
         score = score.masked_fill(
