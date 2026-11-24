@@ -87,3 +87,18 @@ def test_replanning_does_not_blend_an_unchanged_reference_again():
   assert planner.plan is planned
   assert planner.offset == 2 * planner.replan_steps
   torch.testing.assert_close(planner.preview().q[0], motion.q[planner.offset])
+
+
+def test_trackability_ranking_does_not_select_an_incompatible_pace():
+  old = window(1)
+  forward = window(120)
+  twist = forward.q.new_zeros((120, 3))
+  twist[:, 0] = 0.35
+  medium = ReferenceClip("medium", "walk", forward, twist, torch.zeros(3))
+  slow = ReferenceClip("slow", "walk", forward, twist * 0.55, torch.zeros(3))
+  planner = LocomotionPlanner([slow, medium], old, 0.02, pace_margin=0.25)
+  target = torch.tensor([0.35, 0.0, 0.0])
+  planner.filtered_command.copy_(target)
+  planner.update(target, torch.tensor([True, True]))
+  assert planner.clip is medium
+  assert [candidate["clip"] for candidate in planner.last_costs] == ["medium"]

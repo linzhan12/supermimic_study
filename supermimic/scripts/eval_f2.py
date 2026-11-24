@@ -90,6 +90,7 @@ class Config:
   cases: tuple[str, ...] = ()
   trackability_weight: float = 0.0
   prediction_steps: int = 10
+  pace_margin: float | None = None
   strict_contact: bool = True
 
 
@@ -208,6 +209,10 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("The trackability weight must be finite and nonnegative.")
   if not 1 <= cfg.prediction_steps <= 30:
     raise ValueError("Choose 1–30 world-model prediction steps.")
+  if cfg.pace_margin is not None and (
+    not math.isfinite(cfg.pace_margin) or cfg.pace_margin < 0
+  ):
+    raise ValueError("The reference pace margin must be finite and nonnegative.")
   if cfg.motion_only and (
     cfg.steady_forward or cfg.extra_forward_speeds or cfg.multispeed_profile
   ):
@@ -384,6 +389,7 @@ def evaluate(cfg: Config) -> None:
         "strict_contact": cfg.strict_contact,
         "trackability_weight": cfg.trackability_weight,
         "prediction_steps": cfg.prediction_steps,
+        "pace_margin": cfg.pace_margin,
         "world_model_sha256": sha256(dynamics_path)
         if cfg.trackability_weight
         else None,
@@ -438,6 +444,7 @@ def evaluate(cfg: Config) -> None:
             strict_contact=cfg.strict_contact,
             trackability_weight=cfg.trackability_weight,
             prediction_steps=cfg.prediction_steps,
+            pace_margin=cfg.pace_margin,
           )
           if math.hypot(*case_summary["initial_velocity"][:2]) > 0.1:
             planner.mode = "walk"

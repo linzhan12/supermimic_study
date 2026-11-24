@@ -146,6 +146,7 @@ class _Candidate:
   clip: ReferenceClip
   frame: int
   cost: float
+  pace_error: float
 
 
 class LocomotionPlanner:
@@ -164,6 +165,7 @@ class LocomotionPlanner:
     trackability_weight: float = 0.0,
     strict_contact: bool = True,
     prediction_steps: int = 10,
+    pace_margin: float | None = None,
   ) -> None:
     if not any(clip.mode == "walk" for clip in clips):
       raise ValueError("The reference bank requires at least one walking clip.")
@@ -176,6 +178,7 @@ class LocomotionPlanner:
     )
     self.weight = trackability_weight
     self.strict_contact = strict_contact
+    self.pace_margin = pace_margin
     self.plan = initial.hold_after(0, self.preview_length)
     self.clip: ReferenceClip | None = None
     self.frame = 0
@@ -228,10 +231,18 @@ class LocomotionPlanner:
       mode = "stop"
     candidates = self._candidates(mode, observed_contact)
     if not candidates and mode == "start":
-      candidates = self._candidates("walk", observed_contact)
+      mode = "walk"
+      candidates = self._candidates(mode, observed_contact)
     if not candidates:
       self.last_costs = []
       return
+    if mode == "walk" and self.pace_margin is not None:
+      smallest = min(candidate.pace_error for candidate in candidates)
+      candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.pace_error <= smallest + self.pace_margin
+      ]
     candidates = sorted(candidates, key=lambda candidate: candidate.cost)[:4]
     windows = [self._join(candidate) for candidate in candidates]
     prediction = (
@@ -249,6 +260,7 @@ class LocomotionPlanner:
         "clip": candidate.clip.name,
         "frame": candidate.frame,
         "kinematics": candidate.cost,
+        "pace_error": candidate.pace_error,
         "world_model": extra,
         "selected": i == best,
       }
@@ -325,7 +337,10 @@ class LocomotionPlanner:
         score = score - 0.20 * (indices == continued)
       index = int(score.argmin())
       if torch.isfinite(score[index]):
-        choices.append(_Candidate(clip, int(indices[index]), float(score[index])))
+        error = pace_cost.expand_as(score)[index].sqrt().item()
+        choices.append(
+          _Candidate(clip, int(indices[index]), float(score[index]), error)
+        )
     return choices
 
   @staticmethod
