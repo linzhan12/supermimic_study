@@ -328,6 +328,9 @@ class LocomotionPlanner:
     measured_steering_anchor: ReferenceWindow | None = None,
     measured_start_exit: ReferenceWindow | None = None,
     project_seam: Callable[[ReferenceWindow], ReferenceWindow] | None = None,
+    cycle_ingress_anchor: ReferenceWindow | None = None,
+    rank_cycle_ingress: bool = True,
+    split_cycle_ingress: bool = False,
   ) -> None:
     command_rate = command.new_tensor((0.7, 0.6, 1.8))
     self.filtered_command += (command - self.filtered_command).clamp(
@@ -350,6 +353,40 @@ class LocomotionPlanner:
       and bool(observed_twist[:2].norm() < 0.08)
       and abs(float(observed_twist[2])) < 0.15
     )
+    if (
+      cycle_ingress_anchor is not None
+      and direction in ((-1, 0), (1, 0))
+      and bool(cycle_ingress_anchor.contact.any())
+      and (
+        self.mode == "stand"
+        or (
+          self.mode == "stop"
+          and observed_twist is not None
+          and float(observed_twist[:2].norm()) < 0.12
+        )
+        or (self.mode == "start" and self.offset >= self.blend_steps)
+      )
+    ):
+      entries = self._candidates(
+        "walk",
+        cycle_ingress_anchor.contact[0],
+        direction,
+        start_goal=command,
+        seam=cycle_ingress_anchor,
+        periodic_only=True,
+        split_ingress=split_cycle_ingress,
+      )
+      if entries:
+        self._select(
+          entries,
+          "walk",
+          direction,
+          cycle_ingress_anchor,
+          project_seam,
+          score_prediction if rank_cycle_ingress else None,
+          cycle_ingress=True,
+        )
+        return
     if active is not None and self.offset < self.committed_steps:
       return
     if active is None and self.mode == "stop":
@@ -489,6 +526,28 @@ class LocomotionPlanner:
           if recovery is not None:
             self._commit_generated(recovery, "stop", direction)
       return
+    self._select(
+      candidates,
+      mode,
+      direction,
+      seam,
+      project_seam,
+      score_prediction,
+      direct_start=direct_start,
+    )
+
+  def _select(
+    self,
+    candidates: list[_Candidate],
+    mode: Mode,
+    direction: tuple[int, int] | None,
+    seam: ReferenceWindow | None,
+    project_seam: Callable[[ReferenceWindow], ReferenceWindow] | None,
+    score_prediction: Callable[[list[ReferenceWindow]], torch.Tensor] | None,
+    *,
+    cycle_ingress: bool = False,
+    direct_start: bool = False,
+  ) -> None:
     if mode == "walk" and self.pace_margin is not None:
       smallest = min(candidate.pace_error for candidate in candidates)
       candidates = [
@@ -532,6 +591,7 @@ class LocomotionPlanner:
         "world_model": extra,
         "selected": i == best,
         **({"projected_support": projected[i]} if self.rank_contact_seam else {}),
+        **({"measured_cycle_ingress": True} if cycle_ingress else {}),
       }
       for i, (candidate, extra) in enumerate(zip(candidates, prediction, strict=True))
     ]
@@ -549,7 +609,8 @@ class LocomotionPlanner:
     self.offset = 0
     self.committed_steps = (
       self.start_blend_steps
-      if choice.split_start and (seam is None or mode == "start" or direct_start)
+      if choice.split_start
+      and (seam is None or mode == "start" or direct_start or cycle_ingress)
       else self.blend_steps
     )
 
@@ -589,19 +650,21 @@ class LocomotionPlanner:
     start_goal: torch.Tensor | None = None,
     *,
     seam: ReferenceWindow | None = None,
+    periodic_only: bool = False,
+    split_ingress: bool = False,
   ) -> list[_Candidate]:
     old = self.plan.hold_after(self.offset, 1) if seam is None else seam
     old_support = old.contact[0] if old.contact[0].any() else observed_contact
     continued = self.frame + self.offset
     starting = mode == "start" or direct_start
     split_steering = self.steering_split_seam and seam is not None and mode == "walk"
-    split = bool(self.start_legs) and (starting or split_steering)
+    split = bool(self.start_legs) and (starting or split_steering or split_ingress)
     keep_phase = self.preserve_axial_phase and (
       direction if direction is not None else self._direction(self.filtered_command)
     ) == (0, 0)
     choices = []
     for clip in self.clips:
-      if clip.mode != mode:
+      if clip.mode != mode or (periodic_only and not clip.period_steps):
         continue
       if (
         mode == "walk"
@@ -664,11 +727,12 @@ class LocomotionPlanner:
         double_support_start = starting & common.all(-1)
         pose_limit = torch.where(double_support_start, 0.32, 0.26)
         if split:
-          supported = (
-            common.any(-1) & (new_contact == observed_contact).all(-1)
-            if split_steering
-            else double_support_start & observed_contact.all()
-          )
+          if split_ingress:
+            supported = common.any(-1) & (foot_cost < 0.12**2)
+          elif split_steering:
+            supported = common.any(-1) & (new_contact == observed_contact).all(-1)
+          else:
+            supported = double_support_start & observed_contact.all()
           leg_gap = frames.q[indices][:, self.start_legs] - old.q[0, self.start_legs]
           admissible = supported & (leg_gap.square().mean(-1).sqrt() < 0.18)
           pose_limit = torch.where(admissible, 0.55, pose_limit)

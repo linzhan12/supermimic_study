@@ -110,6 +110,71 @@ def test_trackability_ranking_does_not_select_an_incompatible_pace():
   assert [candidate["clip"] for candidate in planner.last_costs] == ["medium"]
 
 
+def test_measured_cycle_ingress_can_ablate_ranking_without_changing_the_seam():
+  measured = window(1)
+  target = torch.tensor([0.25, 0.20, 0.0])
+  twist = target.expand(120, -1)
+  zero = torch.zeros(3)
+  first = ReferenceClip("first", "walk", window(120, 0.02), twist, zero, 60)
+  second = ReferenceClip("second", "walk", window(120, 0.12), twist, zero, 60)
+  start = ReferenceClip("start", "start", window(120), twist, zero, None, target)
+  for ranking, expected in ((False, first), (True, second)):
+    planner = LocomotionPlanner(
+      [first, second, start],
+      measured,
+      0.02,
+      directional_selection=True,
+      restart_from_rest=True,
+      trackability_weight=1.0,
+    )
+    planner.mode = "stop"
+    planner.update(
+      target,
+      measured.contact[0],
+      lambda windows: torch.tensor([float(w.q[10, 0] < 0.1) for w in windows]),
+      observed_twist=zero,
+      cycle_ingress_anchor=measured,
+      rank_cycle_ingress=ranking,
+    )
+    assert planner.clip is expected
+    assert all(entry["measured_cycle_ingress"] for entry in planner.last_costs)
+    torch.testing.assert_close(planner.plan.q[0], measured.q[0], atol=0, rtol=0)
+
+
+def test_cycle_ingress_can_blend_legs_before_a_larger_upper_body_change():
+  measured = window(1)
+  motion = window(120, 0.45)
+  legs = tuple(range(12))
+  motion.q[:, legs] = 0.12
+  target = torch.tensor([0.25, 0.20, 0.0])
+  zero = torch.zeros(3)
+  twist = target.expand(120, -1)
+  cycle = ReferenceClip("walk", "walk", motion, twist, zero, 60)
+  start = ReferenceClip("start", "start", window(120), twist, zero, 0, target)
+  planner = LocomotionPlanner(
+    [cycle, start],
+    measured,
+    0.02,
+    directional_selection=True,
+    restart_from_rest=True,
+    start_legs=legs,
+    start_upper_blend=0.48,
+  )
+  planner.mode = "stop"
+  planner.update(
+    target,
+    measured.contact[0],
+    observed_twist=zero,
+    cycle_ingress_anchor=measured,
+    split_cycle_ingress=True,
+  )
+  assert planner.clip is cycle
+  assert planner.committed_steps == planner.start_blend_steps
+  position = planner.plan.q[planner.blend_steps]
+  torch.testing.assert_close(position[:12], motion.q[0, :12])
+  assert bool((position[12:] < motion.q[0, 12:]).all())
+
+
 def test_axial_continuation_is_eligible_during_a_reference_contact_gap():
   old = window(1)
   frames = window(120)

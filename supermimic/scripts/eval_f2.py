@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 import mjlab.tasks  # noqa: F401
 import torch
@@ -118,6 +119,9 @@ class Config:
   steering_measured_seam: bool = False
   steering_split_seam: bool = False
   early_steering_handoff: bool = False
+  steering_cycle_ingress: Literal["off", "ranked", "kinematic"] = "off"
+  steering_ingress_phases: tuple[str, ...] = ()
+  split_cycle_ingress: bool = False
   project_contact_seam: bool = False
   rank_contact_seam: bool = False
   start_search_time: float | None = None
@@ -385,6 +389,18 @@ def evaluate(cfg: Config) -> None:
     raise ValueError("Choose one to four entry phases per reference.")
   if cfg.axial_cycle_ranking and not cfg.directional_selection:
     raise ValueError("Axial cycle ranking needs direction-specific candidates.")
+  if cfg.steering_cycle_ingress != "off" and (
+    not cfg.directional_selection or cfg.reference_bank is None
+  ):
+    raise ValueError("Measured cycle ingress needs direction-specific references.")
+  if cfg.steering_cycle_ingress == "ranked" and not cfg.trackability_weight:
+    raise ValueError("Ranked cycle ingress needs world-model ranking.")
+  if cfg.steering_ingress_phases and cfg.steering_cycle_ingress == "off":
+    raise ValueError("Cycle ingress phases need measured cycle ingress.")
+  if cfg.split_cycle_ingress and (
+    cfg.steering_cycle_ingress == "off" or cfg.start_upper_blend is None
+  ):
+    raise ValueError("Split ingress needs cycle ingress and an upper-body blend time.")
   if cfg.preserve_axial_phase and cfg.reference_bank is None:
     raise ValueError("Axial phase preservation needs a reference bank.")
   if cfg.steering_measured_seam and not cfg.directional_selection:
@@ -684,6 +700,12 @@ def evaluate(cfg: Config) -> None:
         summary["planning"]["steering_split_seam"] = True
       if cfg.early_steering_handoff:
         summary["planning"]["early_steering_handoff"] = True
+      if cfg.steering_cycle_ingress != "off":
+        summary["planning"].update(
+          steering_cycle_ingress=cfg.steering_cycle_ingress,
+          steering_ingress_phases=cfg.steering_ingress_phases,
+          split_cycle_ingress=cfg.split_cycle_ingress,
+        )
       if cfg.project_contact_seam:
         summary["planning"]["project_contact_seam"] = True
       if cfg.rank_contact_seam:
@@ -913,10 +935,14 @@ def evaluate(cfg: Config) -> None:
             contact_launch = None
             project_seam = None
             measured = None
+            ingress_here = cfg.steering_cycle_ingress != "off" and (
+              not cfg.steering_ingress_phases or phase in cfg.steering_ingress_phases
+            )
             if (
               stance_bridge is not None
               or cfg.steering_measured_seam
               or cfg.start_measured_handoff
+              or ingress_here
             ):
               measured = ReferenceWindow(
                 data.joint_pos,
@@ -965,9 +991,16 @@ def evaluate(cfg: Config) -> None:
                 data.root_link_lin_vel_w,
                 data.root_link_ang_vel_w,
               )[0]
-              if cfg.restart_from_rest
+              if cfg.restart_from_rest or ingress_here
               else None
             )
+            ingress_anchor = None
+            if ingress_here:
+              assert measured is not None
+              stable = contact & (
+                data.site_lin_vel_w[:, foot_sites, :2].norm(dim=-1) <= 0.20
+              )
+              ingress_anchor = replace(measured, contact=stable)
             if tape is None:
               planner.update(
                 target,
@@ -982,6 +1015,9 @@ def evaluate(cfg: Config) -> None:
                 else None,
                 measured_start_exit=measured if cfg.start_measured_handoff else None,
                 project_seam=project_seam,
+                cycle_ingress_anchor=ingress_anchor,
+                rank_cycle_ingress=cfg.steering_cycle_ingress == "ranked",
+                split_cycle_ingress=cfg.split_cycle_ingress,
               )
             else:
               planner.plan = ReferenceWindow(
